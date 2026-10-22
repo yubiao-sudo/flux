@@ -173,6 +173,7 @@ export function App() {
     speechRef.current = createStreamingSpeech({
       onStart: () => setVoiceState('speaking'),
       onEnd: () => setVoiceState('idle'),
+      onAckEnd: () => setVoiceState('thinking'),
       onProgress: (chars) => {
         voiceCharsRef.current = chars;
       },
@@ -376,7 +377,8 @@ export function App() {
   useEffect(() => {
     if (!engine.available) return;
     if (engine.busy) {
-      setVoiceState('thinking');
+      // 即时确认语可能在 busy 置位后的下一帧才开始播放；不要把 speaking 抢回 thinking。
+      setVoiceState((current) => (current === 'speaking' ? current : 'thinking'));
       return;
     }
     if (large !== null) return;
@@ -667,6 +669,13 @@ export function App() {
         setHint('内核推演中 · 再次轻触星核可打断');
         playSfx('message-sent');
         speechRef.current.begin();
+        // 任务一提交就先开口，不等模型首 token。只做一句本地确认，
+        // 不预测具体步骤，避免在还不知道工具结果时说过头。
+        speechRef.current.ack(
+          /看|查|找|搜|浏览|打开|读/.test(normalized)
+            ? '好的，我先看一下。'
+            : '好的，我先处理一下。',
+        );
         const result = await engine.send(input);
         if (seq !== sequenceRef.current) {
           speechRef.current.reset();

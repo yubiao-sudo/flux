@@ -86,6 +86,12 @@ function stripCards(text: string) {
 
 export type StreamingSpeech = {
   begin: () => void;
+  /**
+   * 提交瞬间的本地确认语：不经过模型，也不进入最终回复的流式队列。
+   * 它和正式回复共用 TTS 音色，但正式回复的第一句会排在它后面，
+   * 不会因为 `push()` 检测到新文本而把它截断。
+   */
+  ack: (text: string) => void;
   push: (text: string) => void;
   finish: () => void;
   reset: () => void;
@@ -97,6 +103,8 @@ export type StreamingSpeech = {
 export function createStreamingSpeech(opts: {
   onStart?: () => void;
   onEnd?: () => void;
+  /** 确认语播完、正式回复还没开口时，让调用方把状态从「回应」切回「推演」。 */
+  onAckEnd?: () => void;
   /**
    * 语音读到哪里了（字符数，相对整段回复）。
    *
@@ -117,6 +125,13 @@ export function createStreamingSpeech(opts: {
   let speaking = false;
   let started = false;
   let paused = false;
+  // 提交瞬间的确认语独立于正式回复队列。正式回复到来时只重置主队列，
+  // 不能把还在播放的 ack 一起停掉，否则「即时反馈」会被下一轮 token 截断。
+  let ackPlaying = false;
+  let ackSerial = 0;
+  // 正式回复是否已经开过口。ack 也会触发 onStart，因此不能只看 `started`，
+  // 否则确认语播完回到「推演」后，正式回复第一句会被误判为已经开过口。
+  let mainStarted = false;
 
   const progress = (chars: number) => {
     try {
@@ -137,6 +152,8 @@ export function createStreamingSpeech(opts: {
   let waitingForConfig = false;
   let audio: HTMLAudioElement | null = null;
   let audioPulse = 0;
+  let ackAudio: HTMLAudioElement | null = null;
+  let ackDetach: (() => void) | null = null;
   let prefetch: { text: string; src: string } | null = null;
   let prefetching = false;
   // Small LRU of synthesised clips. Kokoro's cold model load is seconds, but
@@ -176,9 +193,28 @@ export function createStreamingSpeech(opts: {
     }
   };
 
-  const stopPlayback = () => {
+  const stopAckAudio = () => {
+    if (ackDetach) {
+      ackDetach();
+      ackDetach = null;
+    }
+    if (!ackAudio) return;
+    const current = ackAudio;
+    ackAudio = null;
+    current.onended = null;
+    current.onerror = null;
+    try {
+      current.pause();
+      current.currentTime = 0;
+    } catch {
+      /* already detached */
+    }
+  };
+
+  const stopPlayback = (preserveAck = false) => {
     playSerial += 1;
-    if (synth) synth.cancel();
+    // ack 正在播放时，正式回复的新一轮文本不能让 synth.cancel() 把它一起掐掉。
+    if (synth && !(preserveAck && ackPlaying)) synth.cancel();
     stopAudio();
     prefetch = null;
     prefetching = false;
@@ -189,7 +225,9 @@ export function createStreamingSpeech(opts: {
   const pause = () => {
     paused = true;
     try {
-      if (audio) {
+      if (ackAudio) {
+        ackAudio.pause();
+      } else if (audio) {
         audio.pause();
       } else if (synth && synth.speaking) {
         synth.pause();
@@ -202,11 +240,13 @@ export function createStreamingSpeech(opts: {
   const resume = () => {
     paused = false;
     try {
-      if (audio) {
+      if (ackAudio) {
+        if (ackAudio.paused) void ackAudio.play().catch(() => undefined);
+      } else if (audio) {
         if (audio.paused) void audio.play().catch(() => undefined);
       } else if (synth && synth.paused) {
         synth.resume();
-      } else if (!speaking && queue.length > 0) {
+      } else if (!speaking && !ackPlaying && queue.length > 0) {
         pump();
       }
     } catch {
@@ -237,6 +277,7 @@ export function createStreamingSpeech(opts: {
       opts.onEnd?.();
     }
     started = false;
+    mainStarted = false;
   };
 
   const settle = (token: number, serial: number) => {
@@ -280,7 +321,8 @@ export function createStreamingSpeech(opts: {
   };
 
   function pump() {
-    if (speaking) return;
+    // ack 是「开口确认」，正式回复必须排在它后面；否则两个声音会叠在一起。
+    if (speaking || ackPlaying) return;
     // Never let the first sentence use the browser voice just because the
     // saved provider (Doubao / Kokoro / cloud) is still loading. A reply must
     // use one voice from the first word to the last.
@@ -301,7 +343,8 @@ export function createStreamingSpeech(opts: {
       if (!text || text.length < 2) continue;
       speaking = true;
       const serial = ++playSerial;
-      if (!started) {
+      if (!mainStarted) {
+        mainStarted = true;
         started = true;
         dispatchTtsState(true);
         opts.onStart?.();
@@ -407,6 +450,9 @@ export function createStreamingSpeech(opts: {
 
   const reset = () => {
     generation += 1;
+    ackSerial += 1;
+    ackPlaying = false;
+    stopAckAudio();
     full = '';
     carry = '';
     queue = [];
@@ -417,6 +463,7 @@ export function createStreamingSpeech(opts: {
     stopPlayback();
     dispatchTtsState(false);
     started = false;
+    mainStarted = false;
   };
 
   const begin = () => {
@@ -435,9 +482,11 @@ export function createStreamingSpeech(opts: {
       carry = '';
       queue = [];
       searchFrom = 0;
-      stopPlayback();
+      // 新一轮正式回复只重置主队列；正在播的「好的，我先看一下」继续说完。
+      stopPlayback(ackPlaying);
       speaking = false;
-      started = false;
+      mainStarted = false;
+      if (!ackPlaying) started = false;
     }
     streamOpen = true;
     carry += safe.slice(full.length);
@@ -474,6 +523,131 @@ export function createStreamingSpeech(opts: {
     pump();
   };
 
+  const ack = (text: string) => {
+    const phrase = cleanForSpeech(text);
+    if (!phrase) return;
+
+    const serial = ++ackSerial;
+    if (ackPlaying) {
+      stopAckAudio();
+      if (synth) synth.cancel();
+    }
+    // 立刻占住「正在说话」的位置：即使 TTS 配置/首句合成还在路上，
+    // 正式回复也不能抢在确认语前面开口。
+    ackPlaying = true;
+
+    const finishAck = () => {
+      if (serial !== ackSerial) return;
+      ackPlaying = false;
+      ackAudio = null;
+      if (ackDetach) {
+        ackDetach();
+        ackDetach = null;
+      }
+      // 确认语结束、正式回复还没排到可播的句子：先回到「推演」，
+      // 不要把整个模型思考阶段都显示成「回应」。
+      if (streamOpen && !speaking && queue.length === 0) {
+        dispatchTtsState(false);
+        opts.onAckEnd?.();
+      }
+      pump();
+    };
+
+    const playWithBrowser = () => {
+      if (serial !== ackSerial) return;
+      if (!synth) {
+        finishAck();
+        return;
+      }
+      const utterance = new SpeechSynthesisUtterance(phrase);
+      const savedVoice =
+        config && config.provider === 'local' && config.voice
+          ? synth.getVoices().find((voice) => voice.name === config?.voice) ?? null
+          : null;
+      if (savedVoice) utterance.voice = savedVoice;
+      utterance.lang = savedVoice?.lang || 'zh-CN';
+      utterance.rate = 0.94;
+      utterance.pitch = 0.9;
+      utterance.volume = 0.72;
+      utterance.onend = finishAck;
+      utterance.onerror = finishAck;
+      if (!started) {
+        started = true;
+        dispatchTtsState(true);
+        opts.onStart?.();
+      }
+      try {
+        synth.speak(utterance);
+      } catch {
+        finishAck();
+      }
+    };
+
+    const play = () => {
+      if (serial !== ackSerial) return;
+      const cloud = Boolean(config && config.provider && config.provider !== 'local');
+      if (!cloud) {
+        playWithBrowser();
+        return;
+      }
+      void synthesizeTts(phrase)
+        .then((src) => {
+          if (serial !== ackSerial) return;
+          if (!src) {
+            playWithBrowser();
+            return;
+          }
+          const player = new Audio(src.startsWith('data:') ? src : convertFileSrc(src));
+          ackAudio = player;
+          let settled = false;
+          const release = () => {
+            if (ackAudio === player) ackAudio = null;
+            if (ackDetach) {
+              ackDetach();
+              ackDetach = null;
+            }
+          };
+          const done = () => {
+            if (settled) return;
+            settled = true;
+            release();
+            finishAck();
+          };
+          ackDetach = attachTtsAnalyser(player, (energy) => dispatchTtsPulse(energy));
+          player.onended = done;
+          player.onerror = () => {
+            if (settled) return;
+            settled = true;
+            release();
+            // 云端音频失败时退回浏览器语音，至少让确认语出声。
+            if (serial === ackSerial) playWithBrowser();
+          };
+          if (!started) {
+            started = true;
+            dispatchTtsState(true);
+            opts.onStart?.();
+          }
+          void player.play().catch(() => {
+            if (settled) return;
+            settled = true;
+            release();
+            if (serial === ackSerial) playWithBrowser();
+          });
+        })
+        .catch(() => {
+          if (serial === ackSerial) playWithBrowser();
+        });
+    };
+
+    if (!configSettled) {
+      void (configWait ?? refreshConfig()).finally(() => {
+        if (serial === ackSerial) play();
+      });
+    } else {
+      play();
+    }
+  };
+
   const finish = () => {
     streamOpen = false;
     if (carry.trim()) {
@@ -484,7 +658,7 @@ export function createStreamingSpeech(opts: {
       queue.push({ text: tail, start });
       carry = '';
     }
-    if (queue.length > 0 || speaking) {
+    if (queue.length > 0 || speaking || ackPlaying) {
       pump();
     } else {
       finishCycle();
@@ -493,11 +667,12 @@ export function createStreamingSpeech(opts: {
 
   return {
     begin,
+    ack,
     push,
     finish,
     reset,
     pause,
     resume,
-    isActive: () => started || speaking || queue.length > 0,
+    isActive: () => started || speaking || ackPlaying || queue.length > 0,
   };
 }
