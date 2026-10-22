@@ -248,7 +248,8 @@ pnpm tauri dev
 ```
 
 The desktop window is undecorated, 1600 × 1000 by default, and connects to the
-real engine. Build the NSIS installer with `pnpm tauri build` (outputs under
+real engine. Build the NSIS installer with `pnpm desktop:build`
+(`tauri build --features custom-protocol`; outputs under
 `desktop/src-tauri/target/release/bundle/nsis/`).
 
 ### Web design preview
