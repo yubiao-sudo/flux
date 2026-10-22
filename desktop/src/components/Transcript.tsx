@@ -8,6 +8,11 @@ type Props = {
   thinking: boolean;
   docked: boolean;
   streaming?: string;
+  /**
+   * 模型在工具执行前说给用户听的一句旁白。
+   * 只在本轮任务期间显示；落库的聊天记录里没有它。
+   */
+  narration?: string;
   thinkingText?: string;
   /**
    * 让某条**已落地**的消息只显示前 chars 个字。
@@ -24,6 +29,7 @@ export function Transcript({
   thinking,
   docked,
   streaming = '',
+  narration = '',
   thinkingText,
   revealTurn = null,
 }: Props) {
@@ -130,8 +136,24 @@ export function Transcript({
             </article>
           )}
           <AnimatePresence>
-            {thinking && !streaming && (
+            {narration && !streaming && (
               <motion.div
+                key="narration"
+                className="narration-line"
+                initial={{ opacity: 0, y: 4 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: 4 }}
+                transition={{ duration: 0.35, ease: [0.2, 0.8, 0.2, 1] }}
+              >
+                <span className="narration-mark">FLUX · 旁白</span>
+                <span className="narration-text">{narration}</span>
+              </motion.div>
+            )}
+            {thinking &&
+              !streaming &&
+              !(narration && (!thinkingText || thinkingText === '正在组织语言…')) && (
+              <motion.div
+                key="thinking"
                 className="thought-line"
                 initial={{ opacity: 0, y: 4 }}
                 animate={{ opacity: 1, y: 0 }}

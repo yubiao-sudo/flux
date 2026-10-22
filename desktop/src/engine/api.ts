@@ -1083,6 +1083,12 @@ export async function onChatToken(cb: (token: string) => void): Promise<() => vo
   return unlisten;
 }
 
+/** 订阅后端在工具执行前推送的模型旁白（前端即时显示并朗读） */
+export async function onChatNarration(cb: (text: string) => void): Promise<() => void> {
+  const unlisten = await listen<{ text: string }>("chat-narration", (e) => cb(e.payload.text));
+  return unlisten;
+}
+
 /** 订阅后端「本轮为工具调用、清空过渡内容」事件 */
 export async function onChatRoundReset(cb: () => void): Promise<() => void> {
   const unlisten = await listen("chat-round-reset", () => cb());

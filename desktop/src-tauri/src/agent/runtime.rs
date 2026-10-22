@@ -640,9 +640,24 @@ impl<'a> AgentLoop<'a> {
                  3. 不复述：不要复述工具输出的原文、不要重复用户的问题、不要把执行流里已展示的步骤再用文字叙述一遍。\n\
                  4. 不客套：省掉「好的」「明白了」「希望对你有帮助」等开场白与收尾语，也不要总结式收尾。\n\
                  5. 多条信息用短要点列表，每条一行；能用一句话说清的不写一段。\n\
-                 6. 工具连续调用之间不要插入对用户说的话，全部做完后一次性汇报结果。",
+                 6. 工具调用前按【边说边做（旁白）】说一句当前动作；工具连续调用之间不要逐步解说，全部做完后一次性汇报结果。",
             );
         }
+
+        // 边说边做：模型在调用工具前给用户一句具体旁白，前端会立即显示并朗读。
+        // 它不是最终回复，也不是执行日志；只描述下一步动作，避免空话和逐步解说。
+        system_content.push_str(
+            "\n\n【边说边做（旁白）】\n\
+             需要调用工具时，在动手前先用 <say>…</say> 包住一句不超过 30 字的中文旁白，\
+             用第一人称说明你接下来要做的动作，然后立即调用工具。\
+             例：<say>我先查一下今天的日期</say>、<say>我先打开浏览器搜一下</say>、<say>我先读一下这个文件</say>。\
+             旁白会直接显示并朗读给用户，必须口语化、具体；不要用「好的」「马上」「稍等」这类空话，\
+             不要解释内部推理。旁白只描述动作，不描述工具返回的数据、数值、状态或结果；\
+             不要复述搜索结果，也不要报「数据/音量/温度/湿度/进度」这类内容。\
+             如果工具结果不完整，说下一步怎么做（例：<say>这个页面没摘要，我换个来源再查</say>），\
+             不要道歉、不要停在失败上。同一个阶段只说一句；只是继续调用同一类工具时不要再说了，\
+             工具连续执行时只在目标或阶段变化时再说。不需要工具的纯聊天不要输出 <say>，直接回答。",
+        );
 
         // 注入当前工作模式的系统提示词（专业身份 + 方法论 + 产出规范）
         if let Some(mode) = self.state.workmodes.current() {
@@ -780,6 +795,10 @@ impl<'a> AgentLoop<'a> {
         // 连续失败追踪：(工具名+参数指纹, 连续失败次数)。任一成功即清零。
         let mut last_failure: Option<(String, u32)> = None;
         let mut round_no = 0usize;
+        // 工具调用轮的旁白：最多播几句，避免长任务把 TTS 排成一长串，
+        // 反而拖住最终回复。
+        let mut narration_count = 0usize;
+        let mut last_narration = String::new();
 
         loop {
             round_no += 1;
@@ -863,11 +882,21 @@ impl<'a> AgentLoop<'a> {
                 return Ok(append_chat_cards(finalize(resp.content)));
             }
 
-            // 有工具调用：这轮流式内容只是「过渡思考」，清空流式片段，
-            // 但把「过渡思考」作为「话语」保留进执行流，避免被后续执行流覆盖
+            // 有工具调用：这轮流式内容通常是「过渡思考」，不能当成最终回复。
+            // 先清空流式片段；其中符合旁白格式的一句会通过 chat-narration
+            // 立即显示并朗读，剩下的内容仍留在执行流里供排查。
             let _ = self.app.emit("chat-round-reset", json!({}));
             let spoken = resp.content.clone().unwrap_or_default();
-            if !spoken.trim().is_empty() {
+            let narration = narration_from_content(&spoken);
+            if !narration.is_empty()
+                && narration != last_narration
+                && narration_count < 3
+            {
+                narration_count += 1;
+                last_narration = narration.clone();
+                let _ = self.app.emit("chat-narration", json!({ "text": narration }));
+                self.thought("saying", "旁白", &narration);
+            } else if !spoken.trim().is_empty() {
                 self.thought("saying", "话语", &spoken);
             }
             let calls = resp.tool_calls.clone().unwrap();
@@ -1617,6 +1646,146 @@ fn now_ms() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0)
+}
+
+/// 从工具调用前的模型输出里提取一句可以显示/朗读的旁白。
+///
+/// 约定模型用 `<say>…</say>` 标记旁白；如果没有标记（旧模型或没遵守格式），
+/// 退化为取第一句，避免完全丢失「边说边做」。只保留第一句，防止把一整段
+/// 内部推演读给用户。
+fn narration_from_content(text: &str) -> String {
+    let raw = if let Some(start) = text.find("<say>") {
+        let rest = &text[start + "<say>".len()..];
+        match rest.find("</say>") {
+            Some(end) => &rest[..end],
+            None => rest.lines().next().unwrap_or(rest),
+        }
+    } else {
+        text
+    };
+
+    // 多行内容拼成一行；跳过代码块和明显的 JSON/工具参数残片。
+    let mut joined = String::new();
+    for line in raw.lines() {
+        let line = line
+            .trim()
+            .trim_start_matches(|c: char| matches!(c, '#' | '>' | '-' | '*' | '•' | ' '))
+            .trim();
+        if line.is_empty()
+            || line.starts_with("```")
+            || line.starts_with('{')
+            || line.starts_with('[')
+        {
+            continue;
+        }
+        if !joined.is_empty() {
+            joined.push(' ');
+        }
+        joined.push_str(line);
+    }
+    let cleaned = joined
+        .replace("<say>", "")
+        .replace("</say>", "")
+        .replace("**", "")
+        .replace('`', "")
+        .replace('#', "")
+        .trim()
+        .to_string();
+    if cleaned.is_empty() {
+        return String::new();
+    }
+
+    // 只取第一句；问号/感叹号/分号/省略号都算句子边界。
+    let mut end = cleaned.len();
+    for (i, ch) in cleaned.char_indices() {
+        if matches!(
+            ch,
+            '。' | '！' | '？' | '!' | '?' | '；' | ';' | '…' | '\n'
+        ) {
+            end = i + ch.len_utf8();
+            break;
+        }
+    }
+    let mut out = cleaned[..end]
+        .trim()
+        .trim_matches(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '"' | '\''
+                        | '“'
+                        | '”'
+                        | '‘'
+                        | '’'
+                        | '「'
+                        | '」'
+                        | '『'
+                        | '』'
+                        | '`'
+                        | '*'
+                )
+        })
+        .to_string();
+
+    for prefix in ["旁白：", "旁白:", "（旁白）", "(旁白)"] {
+        if let Some(rest) = out.strip_prefix(prefix) {
+            out = rest.trim().to_string();
+            break;
+        }
+    }
+    // 模型偶尔仍会带「好的，」开头；去掉空话，但保留后面的具体动作。
+    for prefix in [
+        "好的，", "好的", "好，", "明白，", "收到，", "没问题，", "稍等，", "马上，",
+    ] {
+        if let Some(rest) = out.strip_prefix(prefix) {
+            let rest = rest.trim();
+            if rest.chars().count() >= 3 {
+                out = rest.to_string();
+            }
+            break;
+        }
+    }
+    if out.chars().count() < 3 {
+        return String::new();
+    }
+    // 只有客套、没有具体动作的句子不值得占 TTS 时间。
+    let bare = out.trim_matches(|c: char| {
+        c.is_whitespace() || "。！？!?，,；;：:…".contains(c)
+    });
+    if matches!(
+        bare,
+        "好的" | "好" | "明白" | "收到" | "稍等" | "马上" | "没问题" | "我来处理" | "正在处理"
+    ) {
+        return String::new();
+    }
+    // 旁白只播「我接下来要做什么」，不播工具结果、数值和状态。
+    // 例：允许「我先查一下今天的日期」「这个页面没摘要，我换个来源再查」；
+    // 拒绝「数据：现在 18°C」「音量 84%」「搜索结果只有一条索引」。
+    if out.starts_with("用户") || out.starts_with("根据用户") {
+        return String::new();
+    }
+    let action_verbs = [
+        "查", "搜", "看", "读", "打开", "获取", "请求", "调用", "检查", "确认",
+        "尝试", "换", "继续", "整理", "计算", "下载", "浏览", "点击", "输入",
+        "等待", "分析", "对比", "生成", "写入", "保存", "发送", "运行", "执行",
+        "连接", "登录", "刷新", "切换", "定位", "找", "问", "试", "核对", "提取",
+        "抓取", "检索", "汇总", "翻", "筛选", "匹配",
+    ];
+    let has_action = action_verbs.iter().any(|verb| out.contains(*verb));
+    let user_facing = out.contains('我')
+        || out.starts_with("先")
+        || out.starts_with("正在")
+        || out.contains("接下来")
+        || out.contains("下一步");
+    if !has_action || !user_facing {
+        return String::new();
+    }
+    // 旁白是口播，不是文章：超过 48 字就截断，避免 TTS 长时间占住。
+    if out.chars().count() > 48 {
+        out = out.chars().take(48).collect::<String>();
+        out.push('…');
+    }
+    out
 }
 
 /// 若模型返回空内容，如实提示（避免前端显示空气泡）。

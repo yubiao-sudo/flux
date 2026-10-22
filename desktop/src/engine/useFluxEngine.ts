@@ -16,6 +16,7 @@ import {
   listConversations,
   listMemoriesPanel,
   onAcuiCard,
+  onChatNarration,
   onChatRoundReset,
   onChatToken,
   onEscalationLevel,
@@ -52,6 +53,61 @@ import type {
 import type { Turn } from '../types';
 
 export type EnginePhase = 'browser' | 'boot' | 'ready' | 'no-model' | 'error';
+
+/**
+ * 把模型流里的 `<say>…</say>` 旁白从正式回复流中摘掉。
+ *
+ * 旁白会在工具调用轮由后端单独发 `chat-narration`。如果让它跟着
+ * `chat-token` 进入 streaming，语音会把同一句读两遍，字幕里也会闪出
+ * XML 标签。这里按 token 增量过滤，并保留可能被切断的标签前缀。
+ */
+class NarrationStreamFilter {
+  private pending = '';
+  private inNarration = false;
+
+  reset() {
+    this.pending = '';
+    this.inNarration = false;
+  }
+
+  push(token: string): string {
+    let text = this.pending + token;
+    this.pending = '';
+    let visible = '';
+    while (text) {
+      if (!this.inNarration) {
+        const open = text.toLowerCase().indexOf('<say>');
+        if (open < 0) {
+          const keep = partialTagTail(text, '<say>');
+          visible += text.slice(0, text.length - keep);
+          this.pending = text.slice(text.length - keep);
+          break;
+        }
+        visible += text.slice(0, open);
+        text = text.slice(open + 5);
+        this.inNarration = true;
+      } else {
+        const close = text.toLowerCase().indexOf('</say>');
+        if (close < 0) {
+          const keep = partialTagTail(text, '</say>');
+          this.pending = text.slice(text.length - keep);
+          break;
+        }
+        text = text.slice(close + 6);
+        this.inNarration = false;
+      }
+    }
+    return visible;
+  }
+}
+
+function partialTagTail(text: string, tag: string): number {
+  const max = Math.min(tag.length - 1, text.length);
+  for (let i = max; i > 0; i -= 1) {
+    if (text.slice(-i).toLowerCase() === tag.slice(0, i)) return i;
+  }
+  return 0;
+}
 
 export type EngineCapability = {
   name: string;
@@ -231,6 +287,13 @@ export function useFluxEngine() {
   const [historyEpoch, setHistoryEpoch] = useState(0);
   const [busy, setBusy] = useState(false);
   const [streaming, setStreaming] = useState('');
+  /**
+   * 模型在工具执行前说给用户听的一句旁白。
+   * 它不写入消息库，也不进入最终回复；任务结束或切换会话时清空。
+   */
+  const [narration, setNarration] = useState('');
+  const narrationFilterRef = useRef<NarrationStreamFilter | null>(null);
+  if (!narrationFilterRef.current) narrationFilterRef.current = new NarrationStreamFilter();
   const [thoughts, setThoughts] = useState<ThoughtEvent[]>([]);
   const [permissions, setPermissions] = useState<PermissionRequest[]>([]);
   const [cards, setCards] = useState<AcuiCardData[]>([]);
@@ -458,13 +521,21 @@ export function useFluxEngine() {
         add(
           onChatToken((token) => {
             if (!aliveRef.current || !chatBusyRef.current) return;
-            setStreaming((current) => current + token);
+            const visible = narrationFilterRef.current?.push(token) ?? token;
+            if (visible) setStreaming((current) => current + visible);
           }),
         ),
         add(
           onChatRoundReset(() => {
             if (!aliveRef.current || !chatBusyRef.current) return;
+            narrationFilterRef.current?.reset();
             setStreaming('');
+          }),
+        ),
+        add(
+          onChatNarration((text) => {
+            if (!aliveRef.current || !chatBusyRef.current) return;
+            setNarration(text);
           }),
         ),
         add(
@@ -645,6 +716,8 @@ export function useFluxEngine() {
       const history = toHistory(turns);
       setThoughts([]);
       setStreaming('');
+      setNarration('');
+      narrationFilterRef.current?.reset();
       chatBusyRef.current = true;
       setBusy(true);
       setTurns((current) => [...current, makeTurn('user', message)]);
@@ -685,6 +758,8 @@ export function useFluxEngine() {
         if (aliveRef.current) {
           setBusy(false);
           setStreaming('');
+          setNarration('');
+          narrationFilterRef.current?.reset();
         }
       }
     },
@@ -701,6 +776,8 @@ export function useFluxEngine() {
     }
     setBusy(false);
     setStreaming('');
+    setNarration('');
+    narrationFilterRef.current?.reset();
   }, [available]);
 
   const switchConversation = useCallback(
@@ -719,6 +796,8 @@ export function useFluxEngine() {
         setTurns(rows.length > 0 ? hydrate(rows) : [welcomeTurn()]);
         setHistoryEpoch((epoch) => epoch + 1);
         setStreaming('');
+        setNarration('');
+        narrationFilterRef.current?.reset();
         setThoughts([]);
         setChatCards([]);
         setSessionNote('');
@@ -742,6 +821,8 @@ export function useFluxEngine() {
       setTurns([welcomeTurn()]);
       setHistoryEpoch((epoch) => epoch + 1);
       setStreaming('');
+      setNarration('');
+      narrationFilterRef.current?.reset();
       setThoughts([]);
       setChatCards([]);
       setSessionNote('新的会话');
@@ -769,6 +850,8 @@ export function useFluxEngine() {
           setConvId(conversation.id);
           setTurns([welcomeTurn()]);
           setHistoryEpoch((epoch) => epoch + 1);
+          setNarration('');
+          narrationFilterRef.current?.reset();
           setSessionNote('已删除，建立新会话');
         } else {
           setSessionNote('已删除会话');
@@ -939,6 +1022,7 @@ export function useFluxEngine() {
     historyEpoch,
     busy,
     streaming,
+    narration,
     thoughts,
     latestThought: thoughts[thoughts.length - 1] ?? null,
     permissions,

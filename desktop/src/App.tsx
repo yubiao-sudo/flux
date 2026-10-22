@@ -391,6 +391,15 @@ export function App() {
     }
   }, [engine.available, engine.phase, engine.busy, large]);
 
+  // 模型旁白：后端在每次工具执行前推一句「我先查一下…」。
+  // 它走独立的插话队列，和提交确认语按顺序播放，正式回复继续排在它们后面。
+  // 放在正式回复 effect 前面：同一帧里如果旁白和首句 token 一起到，
+  // 必须先把旁白排进队列，push() 才不会抢先开口。
+  useEffect(() => {
+    if (!engine.available || !engine.busy || !engine.narration) return;
+    speechRef.current.narrate(engine.narration);
+  }, [engine.available, engine.busy, engine.narration]);
+
   // Speech follows the same token stream as the transcript. It starts on the
   // first complete sentence instead of waiting for the whole reply.
   useEffect(() => {
@@ -1404,6 +1413,7 @@ export function App() {
             thinking={online ? engine.busy || voiceState === 'thinking' : voiceState === 'thinking'}
             docked={docked}
             streaming={online ? liveText.slice(0, revealChars) : ''}
+            narration={online ? engine.narration : ''}
             revealTurn={
               online && !liveText && syncTurnId
                 ? { id: syncTurnId, chars: revealChars }

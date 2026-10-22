@@ -92,6 +92,11 @@ export type StreamingSpeech = {
    * 不会因为 `push()` 检测到新文本而把它截断。
    */
   ack: (text: string) => void;
+  /**
+   * 模型在工具执行前生成的旁白。和 ack 共用一条插话队列：
+   * 先来先播、互不截断，正式回复继续排在所有插话之后。
+   */
+  narrate: (text: string) => void;
   push: (text: string) => void;
   finish: () => void;
   reset: () => void;
@@ -129,6 +134,9 @@ export function createStreamingSpeech(opts: {
   // 不能把还在播放的 ack 一起停掉，否则「即时反馈」会被下一轮 token 截断。
   let ackPlaying = false;
   let ackSerial = 0;
+  // 确认语和模型旁白共用一条队列。新的一句不能截断上一句，
+  // 否则「我先打开浏览器」会被紧接着的「已经找到结果」打断。
+  let ackQueue: string[] = [];
   // 正式回复是否已经开过口。ack 也会触发 onStart，因此不能只看 `started`，
   // 否则确认语播完回到「推演」后，正式回复第一句会被误判为已经开过口。
   let mainStarted = false;
@@ -246,8 +254,9 @@ export function createStreamingSpeech(opts: {
         if (audio.paused) void audio.play().catch(() => undefined);
       } else if (synth && synth.paused) {
         synth.resume();
-      } else if (!speaking && !ackPlaying && queue.length > 0) {
-        pump();
+      } else if (!speaking && !ackPlaying) {
+        if (ackQueue.length > 0) startNextAck();
+        else if (queue.length > 0) pump();
       }
     } catch {
       /* 同 pause */
@@ -321,8 +330,9 @@ export function createStreamingSpeech(opts: {
   };
 
   function pump() {
-    // ack 是「开口确认」，正式回复必须排在它后面；否则两个声音会叠在一起。
-    if (speaking || ackPlaying) return;
+    // ack / 模型旁白是「开口确认」，正式回复必须排在它们后面；
+    // 队列里还有没播完的插话时，也不能让正式回复抢先开口。
+    if (speaking || ackPlaying || ackQueue.length > 0) return;
     // Never let the first sentence use the browser voice just because the
     // saved provider (Doubao / Kokoro / cloud) is still loading. A reply must
     // use one voice from the first word to the last.
@@ -452,6 +462,7 @@ export function createStreamingSpeech(opts: {
     generation += 1;
     ackSerial += 1;
     ackPlaying = false;
+    ackQueue = [];
     stopAckAudio();
     full = '';
     carry = '';
@@ -523,17 +534,16 @@ export function createStreamingSpeech(opts: {
     pump();
   };
 
-  const ack = (text: string) => {
-    const phrase = cleanForSpeech(text);
+  // 确认语与模型旁白共用一条「插话」队列：先来先播，互不截断。
+  // 正式回复的 pump() 会一直等到队列清空，因此不会出现两路声音叠在一起。
+  function startNextAck() {
+    if (ackPlaying || speaking) return;
+    const phrase = ackQueue.shift();
     if (!phrase) return;
 
     const serial = ++ackSerial;
-    if (ackPlaying) {
-      stopAckAudio();
-      if (synth) synth.cancel();
-    }
     // 立刻占住「正在说话」的位置：即使 TTS 配置/首句合成还在路上，
-    // 正式回复也不能抢在确认语前面开口。
+    // 正式回复也不能抢在插话前面开口。
     ackPlaying = true;
 
     const finishAck = () => {
@@ -544,7 +554,16 @@ export function createStreamingSpeech(opts: {
         ackDetach();
         ackDetach = null;
       }
-      // 确认语结束、正式回复还没排到可播的句子：先回到「推演」，
+      // 还有下一句旁白：接着播，不把状态切回「推演」。
+      if (ackQueue.length > 0) {
+        if (speaking) {
+          ackQueue = [];
+        } else {
+          startNextAck();
+          return;
+        }
+      }
+      // 插话结束、正式回复还没排到可播的句子：先回到「推演」，
       // 不要把整个模型思考阶段都显示成「回应」。
       if (streamOpen && !speaking && queue.length === 0) {
         dispatchTtsState(false);
@@ -566,16 +585,16 @@ export function createStreamingSpeech(opts: {
           : null;
       if (savedVoice) utterance.voice = savedVoice;
       utterance.lang = savedVoice?.lang || 'zh-CN';
-      utterance.rate = 0.94;
+      // 确认语/旁白比正式回复慢一点，给用户留出反应时间。
+      utterance.rate = 0.82;
       utterance.pitch = 0.9;
       utterance.volume = 0.72;
       utterance.onend = finishAck;
       utterance.onerror = finishAck;
-      if (!started) {
-        started = true;
-        dispatchTtsState(true);
-        opts.onStart?.();
-      }
+      // 上一句结束后可能已经切回「推演」；新旁白开口时重新点亮「回应」。
+      started = true;
+      dispatchTtsState(true);
+      opts.onStart?.();
       try {
         synth.speak(utterance);
       } catch {
@@ -598,6 +617,8 @@ export function createStreamingSpeech(opts: {
             return;
           }
           const player = new Audio(src.startsWith('data:') ? src : convertFileSrc(src));
+          // 只放慢插话；正式回复仍保持原速。播放速率不会改变音高。
+          player.playbackRate = 0.84;
           ackAudio = player;
           let settled = false;
           const release = () => {
@@ -619,14 +640,12 @@ export function createStreamingSpeech(opts: {
             if (settled) return;
             settled = true;
             release();
-            // 云端音频失败时退回浏览器语音，至少让确认语出声。
+            // 云端音频失败时退回浏览器语音，至少让这句话出声。
             if (serial === ackSerial) playWithBrowser();
           };
-          if (!started) {
-            started = true;
-            dispatchTtsState(true);
-            opts.onStart?.();
-          }
+          started = true;
+          dispatchTtsState(true);
+          opts.onStart?.();
           void player.play().catch(() => {
             if (settled) return;
             settled = true;
@@ -646,6 +665,20 @@ export function createStreamingSpeech(opts: {
     } else {
       play();
     }
+  }
+
+  /**
+   * 提交确认 / 模型旁白共用入口。
+   * 不覆盖正在播放的上一句，而是排队；这样 ack 之后可以接多句
+   * 「我先打开…」「已经找到…」而不会互相截断。
+   */
+  const sayInterjection = (text: string) => {
+    const phrase = cleanForSpeech(text);
+    if (!phrase) return;
+    // 正式回复已经开口时不再插入旁白，避免两路声音重叠。
+    if (speaking) return;
+    ackQueue.push(phrase);
+    if (!ackPlaying) startNextAck();
   };
 
   const finish = () => {
@@ -658,7 +691,7 @@ export function createStreamingSpeech(opts: {
       queue.push({ text: tail, start });
       carry = '';
     }
-    if (queue.length > 0 || speaking || ackPlaying) {
+    if (queue.length > 0 || speaking || ackPlaying || ackQueue.length > 0) {
       pump();
     } else {
       finishCycle();
@@ -667,12 +700,14 @@ export function createStreamingSpeech(opts: {
 
   return {
     begin,
-    ack,
+    ack: sayInterjection,
+    narrate: sayInterjection,
     push,
     finish,
     reset,
     pause,
     resume,
-    isActive: () => started || speaking || ackPlaying || queue.length > 0,
+    isActive: () =>
+      started || speaking || ackPlaying || ackQueue.length > 0 || queue.length > 0,
   };
 }

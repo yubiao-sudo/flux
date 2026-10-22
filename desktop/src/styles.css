@@ -1149,6 +1149,37 @@ textarea {
   color: #6d777e;
 }
 
+/* 模型旁白：工具执行前的一句「我先查一下…」。它不是正式回复，
+   任务结束就消失，所以视觉上比 turn 更轻，但比执行流状态更靠前。 */
+.narration-line {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-left: 60px;
+  padding: 2px 0 1px;
+  border-left: 1px solid rgba(166, 197, 198, 0.14);
+  padding-left: 11px;
+}
+
+.narration-mark {
+  flex: none;
+  padding-top: 3px;
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  color: #7d9397;
+  white-space: nowrap;
+}
+
+.narration-text {
+  max-width: 520px;
+  color: #c4d0cf;
+  font-size: 13px;
+  line-height: 1.65;
+  letter-spacing: 0.01em;
+  text-wrap: pretty;
+}
+
 .thought-text {
   max-width: 480px;
   overflow: hidden;
@@ -1268,6 +1299,16 @@ textarea {
 .core[data-docked='true'] .thought-line {
   margin-left: 39px;
   font-size: 10.5px;
+}
+
+.core[data-docked='true'] .narration-line {
+  margin-left: 39px;
+  padding-left: 9px;
+}
+
+.core[data-docked='true'] .narration-text {
+  max-width: 250px;
+  font-size: 12.5px;
 }
 
 /* ------------------------------------------------------------------ */
