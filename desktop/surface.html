@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>FLUX / SURFACE</title>
+    <script>
+      // 透明浮层窗口（光圈 / 步进横幅 / 悬浮球）必须在**首次绘制之前**把背景置为透明。
+      //
+      // 踩过的坑（真机定位）：这三个窗口由 Rust 侧以 transparent(true) 创建并铺满全屏，
+      // 但本文件下面那条 `#root { background: #050607 }` 让它们变成一块**不透明黑板**。
+      // 于是 GUI 自动化一开光圈，整个屏幕就成了纯 #050607 —— 截图与视觉验证全是黑的；
+      // 又因为它看起来"就像正常的深色界面"，第一时间很难判断是遮挡而不是渲染失败。
+      //
+      // 放在 <head> 里同步执行，而不是等 React 的 useEffect：后者要等首次绘制之后才跑，
+      // 中间那一帧就是黑的（截图恰好落在那一帧就等于没修）。
+      if (/^#\/(halo|step|orb)\b/.test(location.hash)) {
+        document.documentElement.classList.add('flux-transparent-window');
+      }
+    </script>
+    <style>
+      html,
+      body,
+      #root {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        /* 默认不透明深色：浏览器 / 文档 / 终端这些窗口需要正常底色 */
+        background: #050607;
+      }
+
+      /* 透明浮层：html、body、#root **三层都要清**。
+         只清 html/body 而漏掉 #root 是之前的真实 bug —— #root 是 100%×100%
+         的元素，它自己留着不透明背景，就等于整屏一块板。 */
+      html.flux-transparent-window,
+      html.flux-transparent-window body,
+      html.flux-transparent-window #root {
+        background: transparent !important;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/aux-main.jsx"></script>
+  </body>
+</html>

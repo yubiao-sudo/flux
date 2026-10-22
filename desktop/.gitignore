@@ -1,0 +1,42 @@
+# 依赖与构建产物
+node_modules
+dist
+target
+# 打包绕开批量删除护栏时的临时产物（mv dist dist_old_buildN）
+dist_old_build*
+
+# 运行时数据 / 日志 / 截图（不应入库）
+*.db
+*.db-wal
+*.db-shm
+*.log
+baize-screenshot-*.png
+baize-browser-*.png
+baize-som-*.png
+baize-ocr-pre-*.png
+baize-captcha-*.png
+diff-*.png
+
+# 密钥与环境配置
+.env
+.env.*
+*.pem
+
+# 系统与工具杂物
+*.jsonl
+.DS_Store
+Thumbs.db
+desktop.ini
+__pycache__/
+*.pyc
+.trae/
+
+# Tauri 生成物
+src-tauri/gen/
+
+# Vite 临时时间戳文件
+vite.config.ts.timestamp-*.mjs
+
+# 本地工作区（AURORA 前端试验目录 + 会话记忆），不入库
+frontend/
+.workbuddy/

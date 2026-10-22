@@ -1,0 +1,10 @@
+﻿node_modules/
+dist/
+.vite/
+.workbuddy/
+*.tsbuildinfo
+*.log
+.DS_Store
+
+# 安装包历史备份（只保留 release/ 下当前版本）
+release/*.bak-*

@@ -1,0 +1,67 @@
+name: CI
+
+# 项目没有前端测试框架，验收靠两组 headless 浏览器脚本 + 编译检查。
+# 这里把它们串成一条流水线，改动后不用靠人记得手点。
+#
+# 说明：
+#   · windows-latest 自带 Edge 与 MSVC / WebView2，Tauri 能直接编译；
+#   · 浏览器验收需要构建好的 dist，所以先 pnpm build；
+#   · Rust 编译较重，独立成 job，并缓存 cargo 的 target/registry。
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  frontend:
+    name: 前端构建 + 界面验收
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: 安装 pnpm
+        run: npm install -g pnpm@10
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 构建（tsc + vite）
+        run: pnpm build
+
+      - name: 界面验收（布局 / 启动动画 / 着色器编译）
+        run: python scripts/check_ui_layout.py
+
+      - name: 透明浮层验收（光圈 / 弹幕 / 悬浮球不能变成不透明黑板）
+        run: python scripts/check_overlay_transparency.py
+
+      - name: 版本号一致性
+        run: python scripts/bump_version.py --check
+
+  rust:
+    name: Rust 编译 + 单测
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: desktop/src-tauri
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+
+      - name: cargo test
+        # 测试二进制需要 Common-Controls v6 清单，build.rs 已用延迟加载解决
+        run: cargo test --lib --no-fail-fast

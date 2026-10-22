@@ -1,0 +1,932 @@
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use serde_json::{json, Value};
+use tauri::{
+    AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, WebviewUrl, WebviewWindowBuilder,
+};
+
+use crate::tools::{PermissionClass, Tool};
+
+/// 桌面步骤弹幕的历史记录（供浮窗加载时补齐，避免漏掉首条弹幕）
+static STEP_LOG: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+fn step_log() -> &'static Mutex<Vec<String>> {
+    STEP_LOG.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// 推出一条步骤：写入历史记录并广播 `step-push` 事件（供浮窗弹幕滚动）。
+pub fn push_step(app: &AppHandle, text: &str) {
+    let t = text.trim().to_string();
+    if t.is_empty() {
+        return;
+    }
+    step_log().lock().unwrap().push(t.clone());
+    let _ = app.emit("step-push", json!({ "text": t }));
+}
+
+/// 清空步骤历史（GUI 任务结束 / 解除接管时调用，避免下次接管回放旧弹幕）。
+pub fn clear_step_log() {
+    step_log().lock().unwrap().clear();
+}
+
+/// 原生网页窗口编号（每次打开新网页递增，形成独立窗口标签）
+static WEBVIEW_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+const SIDE_WIDTH: f64 = 420.0;
+
+/// 确保浏览器窗口存在并显示（按需调出，定位在主窗口左侧，不挤压主窗口）
+pub fn ensure_browser_window(app: &AppHandle) {
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let _w = crate::hangwatch::watch("windows.rs.ensure_browser_window");
+        if let Some(win) = handle.get_webview_window("browser") {
+            let _ = win.show();
+            let _ = win.set_focus();
+            return;
+        }
+        let (x, y, h) = side_slot(&handle, SIDE_WIDTH, true, "browser");
+        match WebviewWindowBuilder::new(
+            &handle,
+            "browser",
+            WebviewUrl::App("surface.html#/browser".into()),
+        )
+        .title("FLUX · 浏览器")
+        .inner_size(SIDE_WIDTH, h.max(480.0))
+        .position(x, y) // 创建时直接定位，避免「先出现在默认位置再跳」的闪烁
+        .build()
+        {
+            Ok(w) => {
+                let _ = w.set_focus();
+            }
+            Err(e) => eprintln!("[窗口] 创建浏览器窗口失败: {e}"),
+        }
+    });
+}
+
+/// 确保文档窗口存在并显示（按需调出，定位在主窗口右侧，不挤压主窗口）
+pub fn ensure_markdown_window(app: &AppHandle) {
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let _w = crate::hangwatch::watch("windows.rs.ensure_markdown_window");
+        if let Some(win) = handle.get_webview_window("markdown") {
+            let _ = win.show();
+            let _ = win.set_focus();
+            return;
+        }
+        let (x, y, h) = side_slot(&handle, SIDE_WIDTH, false, "markdown");
+        match WebviewWindowBuilder::new(
+            &handle,
+            "markdown",
+            WebviewUrl::App("surface.html#/markdown".into()),
+        )
+        .title("FLUX · 文档")
+        .inner_size(SIDE_WIDTH, h.max(480.0))
+        .position(x, y)
+        .build()
+        {
+            Ok(w) => {
+                let _ = w.set_focus();
+            }
+            Err(e) => eprintln!("[窗口] 创建文档窗口失败: {e}"),
+        }
+    });
+}
+
+/// 确保终端窗口存在并显示（按需调出），关闭窗口时回收终端会话
+pub fn ensure_terminal_window(app: &AppHandle, terminal: Arc<crate::terminal::TerminalState>) {
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let _w = crate::hangwatch::watch("windows.rs.ensure_terminal_window");
+        if let Some(win) = handle.get_webview_window("terminal") {
+            let _ = win.show();
+            let _ = win.set_focus();
+            return;
+        }
+        // 终端窗口：与浏览器/文档同一套侧边落位（宽 760，优先右侧），不再交给系统默认位置遮挡主窗
+        let (tx, ty, th) = side_slot(&handle, 760.0, false, "terminal");
+        match WebviewWindowBuilder::new(
+            &handle,
+            "terminal",
+            WebviewUrl::App("surface.html#/terminal".into()),
+        )
+        .title("FLUX · 终端")
+        .position(tx, ty)
+        .inner_size(760.0, th)
+        .on_page_load(|_win, payload| {
+            eprintln!(
+                "[终端] 页面加载事件: {:?} url={}",
+                payload.event(),
+                payload.url()
+            );
+        })
+        .build()
+        {
+            Ok(w) => {
+                eprintln!(
+                    "[终端] 窗口创建成功，url={:?}",
+                    w.url().map(|u| u.to_string())
+                );
+                let _ = w.set_focus();
+                let t = terminal.clone();
+                w.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { .. } = event {
+                        eprintln!("[终端] 收到关闭事件，回收会话");
+                        t.close();
+                    }
+                });
+            }
+            Err(e) => eprintln!("[窗口] 创建终端窗口失败: {e}"),
+        }
+    });
+}
+
+/// 打开一个外部网页（原生 WebView 窗口，规避 iframe 内嵌的 X-Frame-Options 限制）。
+/// 每次导航新建一个独立网页窗口（标签递增，避免复用窗口需要 navigate 的复杂状态）。
+/// FLUX文档窗口的外链也走这里：文档本体不被导航替换，用户随时可以回到原文。
+/// 必须为 async：Tauri v2 同步命令运行在主线程上，主线程内创建窗口会死锁
+/// （表现为全应用无响应、新窗口白屏加载不出来）。
+#[tauri::command]
+pub async fn open_webview_window(app: AppHandle, url: String) -> Result<(), String> {
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err(format!("非法 URL: {url}"));
+    }
+    open_external_browser(&app, &url);
+    Ok(())
+}
+
+/// 打开一个外部网页（原生 WebView 窗口，规避 iframe 内嵌的 X-Frame-Options 限制）。
+/// 每次导航新建一个独立网页窗口（标签递增，避免复用窗口需要 navigate 的复杂状态）。
+pub fn open_external_browser(app: &AppHandle, url: &str) {
+    let handle = app.clone();
+    // 协议校验放在这一层，而不是只在命令 open_webview_window 里做：
+    // 文档外链、浏览器面板这些内部调用也走这里，放一个 file:// 或自定义协议进去
+    // 只会得到一个空白网页壳——用户看到的就是「应用坏了」。
+    let parsed: tauri::Url = match url.parse() {
+        Ok(u) => u,
+        Err(e) => {
+            let msg = format!("[窗口] 拒绝打开非法 URL: {url}（{e}）");
+            eprintln!("{msg}");
+            crate::windows::diag_log(&msg);
+            return;
+        }
+    };
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        let msg = format!(
+            "[窗口] 拒绝打开非网页协议 {}: {url}（只允许 http/https）",
+            parsed.scheme()
+        );
+        eprintln!("{msg}");
+        crate::windows::diag_log(&msg);
+        return;
+    }
+    let url = url.to_string();
+    let _ = app.run_on_main_thread(move || {
+        let _w = crate::hangwatch::watch("windows.rs.open_external_browser");
+        let n = WEBVIEW_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let label = format!("webview-external-{n}");
+        let want = url.clone();
+        match WebviewWindowBuilder::new(&handle, label, WebviewUrl::External(parsed))
+            .title("FLUX · 网页")
+            .inner_size(1100.0, 760.0)
+            // 窗口内只允许 http/https 导航：网页里点到 file:// 或自定义协议时，
+            // WebView2 会停在一个空白壳里，表现就是「网页窗口什么都没有」。
+            .on_navigation(|u| matches!(u.scheme(), "http" | "https"))
+            // 每个网页窗口的加载结果都落日志：白屏时能查到它到底加载了哪个地址
+            .on_page_load(move |_w, payload| {
+                if let tauri::webview::PageLoadEvent::Finished = payload.event() {
+                    crate::windows::diag_log(&format!(
+                        "[网页窗口] 已加载 {}（请求 {want}）",
+                        payload.url()
+                    ));
+                }
+            })
+            .build()
+        {
+            Ok(w) => {
+                let _ = w.set_focus();
+            }
+            Err(e) => {
+                let msg = format!("[窗口] 创建网页窗口失败: {e}（{url}）");
+                eprintln!("{msg}");
+                crate::windows::diag_log(&msg);
+            }
+        }
+    });
+}
+
+/// 调整浏览器 / 文档窗口大小（像素，主线程执行）
+pub fn resize_window(app: &AppHandle, target: &str, width: f64, height: f64) {
+    let handle = app.clone();
+    let label = target.to_string();
+    let _ = app.run_on_main_thread(move || {
+        let _w = crate::hangwatch::watch("windows.rs.resize_window");
+        if let Some(win) = handle.get_webview_window(&label) {
+            let _ = win.set_size(LogicalSize::new(width, height));
+        }
+    });
+}
+
+/// 计算侧窗落位（逻辑坐标，宽高对齐主窗口）：
+/// 1. 优先贴主窗口偏好一侧（browser=左 / markdown、terminal=右），并排不遮挡；
+/// 2. 偏好侧被其他侧窗占位或贴出屏幕时，自动换另一侧；
+/// 3. 两侧都放不下（屏幕不够宽）才允许遮挡——落在剩余空间更大的一侧并夹回屏幕内。
+/// 返回 (x, y, height)。exclude 传自身窗口标签，避免把自己算进占位。
+fn side_slot(app: &AppHandle, width: f64, prefer_left: bool, exclude: &str) -> (f64, f64, f64) {
+    const GAP: f64 = 8.0;
+    let Some((mx, my, mw, mh)) = main_geometry(app) else {
+        return (0.0, 0.0, 720.0);
+    };
+    // 主窗口所在显示器边界（逻辑坐标）；取不到时视为无限大屏幕
+    let monitor = app
+        .get_webview_window("main")
+        .and_then(|m| m.current_monitor().ok().flatten())
+        .or_else(|| app.primary_monitor().ok().flatten());
+    let (mon_x, mon_y, mon_w, mon_h) = match &monitor {
+        Some(m) => {
+            let scale = m.scale_factor();
+            let pos = m.position();
+            let size = m.size();
+            (
+                pos.x as f64 / scale,
+                pos.y as f64 / scale,
+                size.width as f64 / scale,
+                size.height as f64 / scale,
+            )
+        }
+        None => (0.0, 0.0, f64::MAX, f64::MAX),
+    };
+    // 已打开的兄弟侧窗矩形（同一条侧窗链上要依次排开，不互相叠）
+    let others: Vec<(f64, f64, f64, f64)> = ["browser", "markdown", "terminal"]
+        .iter()
+        .filter(|l| **l != exclude)
+        .filter_map(|l| app.get_webview_window(l))
+        .filter_map(|w| {
+            let pos = w.outer_position().ok()?;
+            let size = w.outer_size().ok()?;
+            let scale = w.scale_factor().ok()?;
+            Some((
+                pos.x as f64 / scale,
+                pos.y as f64 / scale,
+                size.width as f64 / scale,
+                size.height as f64 / scale,
+            ))
+        })
+        .collect();
+
+    // 左侧候选：从主窗左缘向左排，若已有侧窗则继续向左串
+    let mut lx = mx - GAP - width;
+    for (ox, _, ow, _) in &others {
+        if *ox < mx && ox + ow > lx {
+            lx = ox - GAP - width;
+        }
+    }
+    let left_fits = lx >= mon_x;
+    // 右侧候选：从主窗右缘向右排，若已有侧窗则继续向右串
+    let mut rx = mx + mw + GAP;
+    for (ox, _, ow, _) in &others {
+        if *ox >= mx + mw && *ox < rx {
+            rx = ox + ow + GAP;
+        }
+    }
+    let right_fits = rx + width <= mon_x + mon_w;
+
+    let x = if prefer_left && left_fits {
+        lx
+    } else if !prefer_left && right_fits {
+        rx
+    } else if left_fits {
+        lx
+    } else if right_fits {
+        rx
+    } else {
+        // 屏幕不够宽：允许遮挡，挑剩余空间更大的一侧并夹回屏幕内
+        let free_left = mx - mon_x;
+        let free_right = mon_x + mon_w - (mx + mw);
+        if free_left >= free_right {
+            (mx - width).max(mon_x)
+        } else {
+            (mx + mw).min(mon_x + mon_w - width)
+        }
+    };
+    // 垂直方向对齐主窗并夹回显示器内
+    let y = my.max(mon_y);
+    let h = mh.min(mon_y + mon_h - y).max(480.0);
+    (x, y, h)
+}
+
+/// 主窗口几何信息（逻辑坐标）
+fn main_geometry(app: &AppHandle) -> Option<(f64, f64, f64, f64)> {
+    let main = app.get_webview_window("main")?;
+    let pos = main.outer_position().ok()?;
+    let size = main.outer_size().ok()?;
+    let scale = main.scale_factor().ok()?;
+    Some((
+        pos.x as f64 / scale,
+        pos.y as f64 / scale,
+        size.width as f64 / scale,
+        size.height as f64 / scale,
+    ))
+}
+
+// ───────────────────────── resize_window 工具 ─────────────────────────
+
+/// 调整侧窗尺寸工具（FLUX控制两个组件的宽高）
+pub struct ResizeWindowTool {
+    app: AppHandle,
+}
+
+impl ResizeWindowTool {
+    pub fn new(app: AppHandle) -> Self {
+        Self { app }
+    }
+}
+
+impl Tool for ResizeWindowTool {
+    fn name(&self) -> &str {
+        "resize_window"
+    }
+    fn description(&self) -> &str {
+        "调整内置浏览器或文档窗口的宽度和高度（像素）。用于让FLUX按需改变两个组件的大小。"
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "target": {
+                    "type": "string",
+                    "enum": ["browser", "markdown"],
+                    "description": "要调整的窗口：browser=浏览器窗口，markdown=文档窗口"
+                },
+                "width": { "type": "number", "description": "窗口宽度（像素）" },
+                "height": { "type": "number", "description": "窗口高度（像素）" }
+            },
+            "required": ["target", "width", "height"]
+        })
+    }
+    fn permission(&self) -> PermissionClass {
+        PermissionClass::ReadOnly
+    }
+    fn run(&self, args: Value) -> Result<Value, String> {
+        let target = args["target"].as_str().ok_or("缺少参数 target")?;
+        let width = args["width"].as_f64().ok_or("缺少参数 width")?;
+        let height = args["height"].as_f64().ok_or("缺少参数 height")?;
+        if target != "browser" && target != "markdown" {
+            return Err("target 必须是 browser 或 markdown".to_string());
+        }
+        if !(200.0..=3000.0).contains(&width) || !(200.0..=3000.0).contains(&height) {
+            return Err("宽高需在 200~3000 像素之间".to_string());
+        }
+        resize_window(&self.app, target, width, height);
+        Ok(json!({ "ok": true, "target": target, "width": width, "height": height }))
+    }
+}
+
+// ───────────────────────── 桌面步骤弹幕浮窗 ─────────────────────────
+
+/// 计算顶部弹幕浮窗几何（逻辑坐标）：横跨主显示器顶部、占一整条细带
+fn top_bar_geometry(app: &AppHandle) -> (f64, f64, f64, f64) {
+    // 主窗口在接管期间是最小化态，current_monitor() 可能返回 None，
+    // 优先用主显示器（弹幕条固定贴主屏顶部）
+    let mon = app.primary_monitor().ok().flatten();
+    if let Some(mon) = mon {
+        let size = mon.size();
+        let pos = mon.position();
+        let scale = mon.scale_factor();
+        let w = size.width as f64 / scale;
+        let h = 92.0;
+        let x = pos.x as f64 / scale;
+        let y = pos.y as f64 / scale;
+        return (w, h, x, y);
+    }
+    (1280.0, 92.0, 0.0, 0.0)
+}
+
+/// 主显示器全屏几何（逻辑坐标）：光圈覆盖层铺满整个主屏。
+/// 注意：接管期间主窗口已被最小化，`main.current_monitor()` 在最小化态可能返回 None，
+/// 此处改用 app.primary_monitor()（与主窗口状态无关）。
+fn full_screen_geometry(app: &AppHandle) -> (f64, f64, f64, f64) {
+    if let Ok(Some(mon)) = app.primary_monitor() {
+        let size = mon.size();
+        let pos = mon.position();
+        let scale = mon.scale_factor();
+        return (
+            size.width as f64 / scale,
+            size.height as f64 / scale,
+            pos.x as f64 / scale,
+            pos.y as f64 / scale,
+        );
+    }
+    (1280.0, 800.0, 0.0, 0.0)
+}
+
+/// 包含物理坐标点 (x, y) 的显示器全屏几何（逻辑坐标）；
+/// 找不到时回退主显示器。光圈覆盖层需要铺在「目标应用所在」的显示器上。
+fn monitor_geometry_at(app: &AppHandle, x: i32, y: i32) -> (f64, f64, f64, f64) {
+    if let Ok(monitors) = app.available_monitors() {
+        for mon in monitors.iter() {
+            let mx = mon.position().x;
+            let my = mon.position().y;
+            let mw = mon.size().width as i32;
+            let mh = mon.size().height as i32;
+            if x >= mx && x < mx + mw && y >= my && y < my + mh {
+                let scale = mon.scale_factor();
+                return (
+                    mw as f64 / scale,
+                    mh as f64 / scale,
+                    mx as f64 / scale,
+                    my as f64 / scale,
+                );
+            }
+        }
+    }
+    full_screen_geometry(app)
+}
+
+/// 让窗口**从屏幕捕获中排除**：用户照常看得到，截图 / 录屏里没有它。
+///
+/// 为什么需要：光圈覆盖层、步骤横幅、悬浮球都是 FLUX 自己的装饰。
+/// 它们出现在 agent 自己的截图里会污染视觉判断；更糟的是，只要某个浮层背景
+/// 不透明（真机上就因为漏清 `#root` 背景，把整屏涂成纯 #050607），截图就彻底失效。
+/// 用 `WDA_EXCLUDEFROMCAPTURE` 之后，浮层只存在于用户眼前，截图永远是目标应用本身。
+///
+/// 需要 Win10 2004+；老系统或调用失败时静默降级，不影响主流程。
+#[cfg(target_os = "windows")]
+pub fn exclude_from_capture(win: &tauri::WebviewWindow) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE,
+    };
+    if let Ok(h) = win.hwnd() {
+        // tauri 依赖的 windows crate 与本 crate 版本不同，HANDLE 不能跨版本直接传，
+        // 只能取出句柄的整数值，再按本地版本的类型重建。
+        let raw = h.0 as isize;
+        let hwnd = windows::Win32::Foundation::HWND(raw);
+        unsafe {
+            let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn exclude_from_capture(_win: &tauri::WebviewWindow) {}
+
+/// 最小化FLUX主窗口（给桌面腾出空间）
+pub fn minimize_main_window(app: &AppHandle) {
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let _w = crate::hangwatch::watch("windows.rs.minimize_main_window");
+        if let Some(main) = handle.get_webview_window("main") {
+            let _ = main.minimize();
+        }
+    });
+}
+
+/// 恢复并聚焦FLUX主窗口
+pub fn restore_main_window(app: &AppHandle) {
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let _w = crate::hangwatch::watch("windows.rs.restore_main_window");
+        if let Some(main) = handle.get_webview_window("main") {
+            let _ = main.show();
+            let _ = main.unminimize();
+            let _ = main.set_focus();
+        }
+    });
+}
+
+/// 确保顶部弹幕横幅浮窗存在并显示（透明、无边框、置顶、鼠标穿透）
+pub fn ensure_step_window(app: &AppHandle) {
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let _w = crate::hangwatch::watch("windows.rs.ensure_step_window");
+        if let Some(win) = handle.get_webview_window("step") {
+            let _ = win.show();
+            let _ = win.set_ignore_cursor_events(true);
+            // 重申最高层：防止被其他置顶窗口盖住
+            let _ = win.set_always_on_top(true);
+            return;
+        }
+        let (w, h, x, y) = top_bar_geometry(&handle);
+        diag_log(&format!(
+            "[弹幕] 创建步骤横幅 geometry=({x:.0},{y:.0} {w:.0}x{h:.0})"
+        ));
+        // 与光圈覆盖层同款创建序列：先隐藏创建 → 配置穿透/置顶 → 再显示。
+        // 透明窗口「先显示后设穿透」在部分 WebView2 环境会触发合成层竞态导致进程崩溃
+        // （GUI 自动化时上方横幅一出现就崩的主嫌疑）；halo 用此序列已稳定运行数天
+        match WebviewWindowBuilder::new(&handle, "step", WebviewUrl::App("surface.html#/step".into()))
+            .title("FLUX · 步骤")
+            .decorations(false)
+            .transparent(true)
+            .skip_taskbar(true)
+            .always_on_top(true)
+            .shadow(false)
+            .resizable(false)
+            .inner_size(w, h)
+            .position(x, y)
+            .visible(false)
+            .build()
+        {
+            Ok(win) => {
+                // 鼠标穿透：弹幕浮窗不拦截对桌面/目标窗口的点击；并锁死最高层
+                let _ = win.set_ignore_cursor_events(true);
+                let _ = win.set_always_on_top(true);
+                // 弹幕横幅也排除出捕获：否则每次截图顶上都被它占掉一条
+                exclude_from_capture(&win);
+                let _ = win.show();
+                diag_log("[弹幕] 步骤横幅创建成功并已显示（已排除出屏幕捕获）");
+            }
+            Err(e) => {
+                eprintln!("[窗口] 创建步骤浮窗失败: {e}");
+                diag_log(&format!("[弹幕] 创建步骤横幅失败: {e}"));
+            }
+        }
+    });
+}
+
+/// 隐藏弹幕浮窗
+pub fn hide_step_window(app: &AppHandle) {
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let _w = crate::hangwatch::watch("windows.rs.hide_step_window");
+        if let Some(win) = handle.get_webview_window("step") {
+            let _ = win.hide();
+        }
+    });
+}
+
+// ───────────────── 目标应用光圈覆盖层（halo） ─────────────────
+
+/// 覆盖层页面是否已订阅 `halo-event`。
+///
+/// 覆盖窗首次创建后，WebView 需要数百毫秒到两秒才加载完页面并挂载 React；
+/// 这段窗口期内 emit 的事件会被**静默丢弃**——这正是「元素定位方框第一次完全不显示」
+/// 的根因。此标志由覆盖层页面挂载完成后调用 `halo_overlay_ready` 置位；
+/// 未就绪时事件改为入队缓存，页面就绪后一次性重放。
+static HALO_READY: AtomicBool = AtomicBool::new(false);
+/// 未送达覆盖层的事件队列：(时间戳毫秒, 事件体)。只保留最近 5 秒、最多 12 条。
+static HALO_PENDING: OnceLock<Mutex<Vec<(u64, Value)>>> = OnceLock::new();
+/// 标记代号：每次元素标记自增，自动隐藏线程据此判断期间是否出现新标记（有则让位）
+static HALO_MARK_GEN: AtomicU64 = AtomicU64::new(0);
+/// 连续「等不到覆盖层就绪」的次数：覆盖层真的不可用（透明窗被系统拦下等）时用它短路，
+/// 避免之后每次交互都白等满超时。
+static HALO_READY_MISSES: AtomicU32 = AtomicU32::new(0);
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn halo_pending_cell() -> &'static Mutex<Vec<(u64, Value)>> {
+    HALO_PENDING.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn halo_push_pending(ev: &Value) {
+    if let Ok(mut g) = halo_pending_cell().lock() {
+        let now = now_ms();
+        g.push((now, ev.clone()));
+        g.retain(|(t, _)| now.saturating_sub(*t) < 5000);
+        let len = g.len();
+        if len > 12 {
+            g.drain(0..len - 12);
+        }
+        // 落盘留痕：方框「看不见」时，这条日志能区分「事件没发出去」和「发出去了但没渲染」
+        diag_log(&format!(
+            "[光圈] 覆盖层未就绪，事件暂存（队列 {} 条）type={}",
+            g.len(),
+            ev.get("type").and_then(|t| t.as_str()).unwrap_or("?")
+        ));
+    }
+}
+
+/// 事件投递唯一入口：覆盖层未就绪（窗口未创建 / 页面仍在加载）时入队，就绪后重放。
+fn halo_emit(app: &AppHandle, ev: Value) {
+    // 窗口是否存在要同步判断：ensure_halo_window 是异步投递到主线程的，
+    // 若在这里异步等它建完，事件已经发出去了。
+    if app.get_webview_window("halo").is_none() {
+        HALO_READY.store(false, Ordering::SeqCst);
+        halo_push_pending(&ev);
+        return;
+    }
+    if HALO_READY.load(Ordering::SeqCst) {
+        if let Err(e) = app.emit("halo-event", &ev) {
+            diag_log(&format!("[光圈] 事件广播失败({e})，转入暂存"));
+            HALO_READY.store(false, Ordering::SeqCst);
+            halo_push_pending(&ev);
+        }
+    } else {
+        halo_push_pending(&ev);
+    }
+}
+
+/// 覆盖层就绪信号：页面订阅完成后自报，并领取未送达事件重放（返回事件数组）。
+#[tauri::command]
+pub fn halo_overlay_ready() -> Value {
+    let _w = crate::hangwatch::watch("cmd.halo_overlay_ready");
+    HALO_READY.store(true, Ordering::SeqCst);
+    let mut out: Vec<Value> = Vec::new();
+    if let Ok(mut g) = halo_pending_cell().lock() {
+        let now = now_ms();
+        for (t, ev) in g.drain(..) {
+            if now.saturating_sub(t) < 4000 {
+                out.push(ev);
+            }
+        }
+    }
+    if !out.is_empty() {
+        diag_log(&format!("[光圈] 覆盖层就绪，重放暂存事件 {} 条", out.len()));
+    }
+    json!(out)
+}
+
+/// 等待覆盖层可显示：交互前调用，确保方框真的画上屏了再去点击。
+/// 返回 true = 页面已订阅（事件已送达，方框即将渲染）。
+pub fn halo_wait_ready(timeout: std::time::Duration) -> bool {
+    let t0 = now_ms();
+    let limit = timeout.as_millis() as u64;
+    loop {
+        if HALO_READY.load(Ordering::SeqCst) {
+            HALO_READY_MISSES.store(0, Ordering::SeqCst);
+            return true;
+        }
+        if now_ms().saturating_sub(t0) >= limit {
+            HALO_READY_MISSES.fetch_add(1, Ordering::SeqCst);
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(40));
+    }
+}
+
+/// 已连续多少次等不到覆盖层就绪（调用方据此把后续等待缩短，避免反复白等）
+pub fn halo_ready_misses() -> u32 {
+    HALO_READY_MISSES.load(Ordering::SeqCst)
+}
+
+/// 全屏透明穿透覆盖窗：渲染「目标应用边缘光圈」与「组件点击光环」。
+/// 事件协议（halo-event）：{type:"window", rect:[x,y,w,h], title} 圈住目标应用；
+/// {type:"flash", x, y, w?, h?} 在被点组件位置闪一圈光环；
+/// {type:"rect", rect:[x,y,w,h], label} 画出目标元素定位方框（Browser Use 风格选框 + 标签）；
+/// {type:"clear"} 清除。坐标一律为物理屏幕像素，覆盖层按自身 dpr 换算成 CSS 坐标。
+pub fn ensure_halo_window(app: &AppHandle) {
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let _w = crate::hangwatch::watch("windows.rs.ensure_halo_window");
+        if let Some(win) = handle.get_webview_window("halo") {
+            let _ = win.show();
+            let _ = win.set_ignore_cursor_events(true);
+            let _ = win.set_always_on_top(true);
+            return;
+        }
+        let (w, h, x, y) = full_screen_geometry(&handle);
+        eprintln!("[光圈] 创建覆盖层 geometry=({x:.0},{y:.0} {w:.0}x{h:.0})");
+        diag_log(&format!("[光圈] 创建覆盖层 geometry=({x:.0},{y:.0} {w:.0}x{h:.0})"));
+        match WebviewWindowBuilder::new(&handle, "halo", WebviewUrl::App("surface.html#/halo".into()))
+            .title("FLUX · 目标光圈")
+            .decorations(false)
+            .transparent(true)
+            .skip_taskbar(true)
+            .always_on_top(true)
+            .shadow(false)
+            .resizable(false)
+            .inner_size(w, h)
+            .position(x, y)
+            .visible(false)
+            .build()
+        {
+            Ok(win) => {
+                let _ = win.set_ignore_cursor_events(true);
+                let _ = win.set_always_on_top(true);
+                // 光圈只给用户看：从屏幕捕获里排除，agent 的截图永远不含这层装饰
+                exclude_from_capture(&win);
+                let _ = win.show();
+                diag_log("[光圈] 覆盖层创建成功并已显示（已排除出屏幕捕获）");
+            }
+            Err(e) => {
+                eprintln!("[窗口] 创建光圈覆盖层失败: {e}");
+                diag_log(&format!("[光圈] 创建覆盖层失败: {e}"));
+            }
+        }
+    });
+}
+
+/// 把光圈覆盖层挪到包含物理坐标点 (x, y) 的显示器上并铺满该屏。
+/// 覆盖窗创建时按主屏铺满；目标应用在副屏时必须迁移，否则光圈画在错误的屏上。
+fn position_halo_on(app: &AppHandle, x: i32, y: i32) {
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let _w = crate::hangwatch::watch("windows.rs.position_halo_on");
+        if let Some(win) = handle.get_webview_window("halo") {
+            // 已在目标屏上则不折腾（避免每次点击都闪动）
+            if let Ok(Some(mon)) = win.current_monitor() {
+                let mx = mon.position().x;
+                let my = mon.position().y;
+                let mw = mon.size().width as i32;
+                let mh = mon.size().height as i32;
+                if x >= mx && x < mx + mw && y >= my && y < my + mh {
+                    return;
+                }
+            }
+            let (w, h, wx, wy) = monitor_geometry_at(&handle, x, y);
+            eprintln!("[光圈] 覆盖层迁移至 ({wx:.0},{wy:.0} {w:.0}x{h:.0})");
+            diag_log(&format!("[光圈] 覆盖层迁移至 ({wx:.0},{wy:.0} {w:.0}x{h:.0})"));
+            let _ = win.set_size(LogicalSize::new(w, h));
+            let _ = win.set_position(LogicalPosition::new(wx, wy));
+            let _ = win.set_always_on_top(true);
+        }
+    });
+}
+
+/// 最近一次「目标窗口」光圈事件（供覆盖层页面加载后补拉，消除首事件竞态：
+/// 覆盖窗创建后页面 JS 订阅完成前 emit 的事件会丢失，导致整轮任务看不到呼吸圈）
+static LAST_HALO: OnceLock<Mutex<Option<Value>>> = OnceLock::new();
+
+/// 光圈环绕目标应用窗口（物理屏幕坐标）
+pub fn halo_target_window(app: &AppHandle, rect: [i32; 4], title: &str) {
+    let event = json!({
+        "type": "window",
+        "rect": rect,
+        "title": title,
+    });
+    println!("[光圈] 点亮目标「{title}」rect={rect:?}");
+    diag_log(&format!("[光圈] 点亮目标「{title}」rect={rect:?}"));
+    // 记录最近事件 + 先行迁移覆盖层（run_on_main_thread 按调用顺序执行，先迁移后 emit）
+    let cell = LAST_HALO.get_or_init(|| Mutex::new(None));
+    if let Ok(mut g) = cell.lock() {
+        *g = Some(event.clone());
+    }
+    ensure_halo_window(app);
+    position_halo_on(app, (rect[0] + rect[2] / 2).max(0), (rect[1] + rect[3] / 2).max(0));
+    halo_emit(app, event);
+}
+
+/// 组件点击光环：在物理屏幕坐标 (x, y) 处闪一圈光环
+pub fn halo_flash_at(app: &AppHandle, x: i32, y: i32) {
+    ensure_halo_window(app);
+    halo_emit(app, json!({ "type": "flash", "x": x, "y": y }));
+}
+
+/// 元素定位方框：在物理屏幕坐标的矩形 rect=[x,y,w,h] 上画出「Browser Use 风格」的
+/// 目标元素选框 + 文字标签，用于把「即将操作哪个元素」可视化为页面/屏幕上的实框。
+/// 非接管模式下，标记消散后自动隐藏覆盖层（透明置顶窗不常驻，避免干挂一整个会话）；
+/// 接管模式下覆盖层由 engage/disengage 生命周期管理，不做自动隐藏。
+pub fn halo_mark_rect(app: &AppHandle, rect: [i32; 4], label: &str) {
+    if rect[2] <= 0 || rect[3] <= 0 {
+        return;
+    }
+    ensure_halo_window(app);
+    position_halo_on(app, (rect[0] + rect[2] / 2).max(0), (rect[1] + rect[3] / 2).max(0));
+    let event = json!({
+        "type": "rect",
+        "rect": rect,
+        "x": rect[0],
+        "y": rect[1],
+        "w": rect[2],
+        "h": rect[3],
+        "label": label,
+    });
+    diag_log(&format!("[光圈] 元素方框 rect={rect:?} label={label}"));
+    halo_emit(app, event);
+
+    // 标记代号：期间出现新标记时旧隐藏线程让位，避免把刚画的框提前收掉
+    let gen = HALO_MARK_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+
+    if crate::takeover::is_active() {
+        return;
+    }
+    // 非接管模式：等覆盖层真正就绪（首次创建要等页面加载）再起算可见时长，
+    // 否则「标记 → 页面加载 → 显示」还没走完就被隐藏，方框一闪都不闪。
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        let t0 = now_ms();
+        while !HALO_READY.load(Ordering::SeqCst) && now_ms().saturating_sub(t0) < 6000 {
+            std::thread::sleep(std::time::Duration::from_millis(80));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(4500));
+        if HALO_MARK_GEN.load(Ordering::SeqCst) == gen && !crate::takeover::is_active() {
+            halo_clear(&handle);
+        }
+    });
+}
+
+/// 供覆盖层页面挂载时补拉最近的目标光圈事件（可能为 null）
+#[tauri::command]
+pub fn halo_get_last() -> Value {
+    let _w = crate::hangwatch::watch("cmd.halo_get_last");
+    LAST_HALO
+        .get()
+        .and_then(|cell| cell.lock().ok().and_then(|g| g.clone()))
+        .unwrap_or(Value::Null)
+}
+
+/// 前端日志透传：覆盖层窗口（halo/step）的 WebView 控制台不可见，
+/// 关键诊断信息经此打到后端控制台
+#[tauri::command]
+pub fn frontend_log(msg: String) {
+    println!("[前端] {}", msg.trim());
+    diag_log(&format!("[前端] {}", msg.trim()));
+}
+
+/// 覆盖层诊断日志（exe 同目录 baize-overlay.log）：双击启动时控制台不可见，
+/// 光圈/弹幕链路的关键事件落盘，供事后排查（每次追加写入，频率极低）
+pub fn diag_log(line: &str) {
+    use std::io::Write;
+    let Some(path) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("baize-overlay.log")))
+    else {
+        return;
+    };
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "{ts} {line}");
+    }
+}
+
+/// 清除光圈
+pub fn halo_clear(app: &AppHandle) {
+    if let Some(handle) = app.get_webview_window("halo") {
+        let _ = handle.hide();
+    }
+}
+
+/// 展示一条步骤弹幕工具（自动最小化主窗口 + 弹幕浮窗滚动）
+pub struct ShowStepTool {
+    app: AppHandle,
+}
+
+impl ShowStepTool {
+    pub fn new(app: AppHandle) -> Self {
+        Self { app }
+    }
+}
+
+impl Tool for ShowStepTool {
+    fn name(&self) -> &str {
+        "show_step"
+    }
+    fn description(&self) -> &str {
+        "在桌面底部以「直播间弹幕」风格滚动展示当前执行步骤。调用时会自动最小化FLUX主窗口并在桌面显示透明浮窗；每完成一步再次调用即推出一条新弹幕。适合 GUI 自动化等耗时/多步任务时让用户直观看到进度（只读，无需授权）"
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "text": { "type": "string", "description": "要展示的步骤文本，如「正在打开资源管理器…」" }
+            },
+            "required": ["text"]
+        })
+    }
+    fn permission(&self) -> PermissionClass {
+        PermissionClass::ReadOnly
+    }
+    fn run(&self, args: Value) -> Result<Value, String> {
+        let text = args["text"].as_str().ok_or("缺少参数 text")?.to_string();
+        minimize_main_window(&self.app);
+        ensure_step_window(&self.app);
+        push_step(&self.app, &text);
+        Ok(json!({ "ok": true }))
+    }
+}
+
+/// 收起弹幕浮窗工具（结束 GUI 自动化后调用）
+pub struct HideStepTool {
+    app: AppHandle,
+}
+
+impl HideStepTool {
+    pub fn new(app: AppHandle) -> Self {
+        Self { app }
+    }
+}
+
+impl Tool for HideStepTool {
+    fn name(&self) -> &str {
+        "hide_step"
+    }
+    fn description(&self) -> &str {
+        "收起桌面步骤弹幕浮窗并恢复FLUX主窗口，用于 GUI 自动化任务结束后的收尾（只读，无需授权）"
+    }
+    fn schema(&self) -> Value {
+        json!({ "type": "object", "properties": {} })
+    }
+    fn permission(&self) -> PermissionClass {
+        PermissionClass::ReadOnly
+    }
+    fn run(&self, _args: Value) -> Result<Value, String> {
+        clear_step_log();
+        hide_step_window(&self.app);
+        restore_main_window(&self.app);
+        Ok(json!({ "ok": true }))
+    }
+}
+
+/// 读取当前步骤弹幕历史（供浮窗页面加载时补齐）
+#[tauri::command]
+pub fn get_step_log() -> Vec<String> {
+    let _w = crate::hangwatch::watch("cmd.get_step_log");
+    step_log().lock().unwrap().clone()
+}

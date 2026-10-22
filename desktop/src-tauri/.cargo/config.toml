@@ -1,0 +1,10 @@
+# Reuse the already-built Baize dependency graph. The backend is large and the
+# existing cargo target contains validated artifacts for this exact toolchain.
+[build]
+target-dir = "F:/deepseek harness/deepseekworkplace/baize/src-tauri/target"
+
+[source.crates-io]
+replace-with = "rsproxy-sparse"
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
