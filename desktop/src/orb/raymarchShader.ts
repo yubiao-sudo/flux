@@ -30,9 +30,9 @@ varying vec2 vUv;
 
 ${simplexNoise}
 
-  // 仅用于射线区间裁剪的**包围球**，不再绘制玻璃壳。
-  // 这一版去掉了外面的水晶球，只保留磁流体本体；
-  // 半径 1.35 要容纳尖刺（上限 1.31）与绕行的小液滴（~1.2）。
+  // 仅用于射线区间裁剪的**包围球**，不是玻璃壳。
+  // 液体本体按设计稿恢复到半径约 0.91，外面不再画水晶球；
+  // 半径 1.35 继续容纳磁尖峰（上限 1.32）与绕行的小液滴（~1.25）。
   const float BOUND_R = 1.35;
 
 float smin(float a, float b, float k) {
@@ -43,37 +43,35 @@ float smin(float a, float b, float k) {
 float fluidRadius(vec3 n) {
   float t = uTime;
 
-  // Ferrofluid reads as a compact magnetic droplet with a moving meniscus.
-  // Two low-frequency noise fields warp the envelope; a third, much faster
-  // field supplies the fine magneto-capillary shimmer.
+  // DESIGN.md §8: a large body based on a 0.91 sphere. Two low-frequency
+  // simplex tides warp the envelope; a fast field adds the fine capillary
+  // shimmer. The glass shell is gone, but the liquid keeps the doc's volume.
   float flow = snoise(n * 1.16 + vec3(0.0, t * 0.12, t * 0.035));
   float swirl = snoise(n * 2.15 + vec3(t * 0.24, -t * 0.09, 0.0));
   float shimmer = snoise(n * 5.2 + vec3(0.0, t * 0.62, -t * 0.28));
 
-  float r = 0.64;
-  r += flow * 0.019;
-  r += swirl * 0.006;
-  r += shimmer * 0.0016;
+  float r = 0.91;
+  r += flow * 0.024;
+  r += swirl * 0.008;
+  r += shimmer * 0.0020;
 
   // Sound pressure swells the body; the low end moves the mass, the treble
   // only shivers the skin.
-  r += uBass * 0.048 * (0.55 + 0.45 * flow);
+  r += uBass * 0.052 * (0.55 + 0.45 * flow);
   r += uTreble * 0.015 * sin(n.y * 17.0 + t * 4.6 + flow * 4.0);
   r += uLevel * 0.010;
   r -= uThinking * 0.012;
 
-  // Rosensweig instability: sharp magnetic crowns on a soft, asymmetric
-  // liquid skirt. Narrowing the cone makes them read as field peaks rather
-  // than as a faceted rock, while the skirt keeps the meniscus liquid.
-  float spikes = 0.0;
+  // Eight narrow Rosensweig peaks: the doc's magnetic crowns. Keeping the
+  // cones tight preserves a smooth liquid base instead of turning the whole
+  // silhouette into an eight-sided polygon; each crown breathes on its own
+  // phase so the idle body still looks like a liquid.
   for (int i = 0; i < 8; i++) {
     float a = max(dot(n, uDirs[i]), 0.0);
-    float cone = pow(a, 12.0);
-    float skirt = pow(a, 2.0);
-    float wobble = 0.70 + 0.30 * sin(t * (1.1 + float(i) * 0.37) + float(i) * 1.37 + flow * 2.2);
-    spikes += (cone * 0.80 + skirt * 0.20) * uAmps[i] * wobble;
+    float peak = pow(a, 36.0) * 0.28 + pow(a, 80.0) * 0.18;
+    float pulse = 0.55 + 0.45 * sin(t * (0.55 + float(i) * 0.17) + float(i) * 2.1 + flow * 1.4);
+    r += uAmps[i] * peak * pulse * (0.4 + uMid * 0.9 + uSpeaking * 0.35);
   }
-  r += spikes * 0.46;
 
   // Slow capillary waves keep the silhouette from ever settling into a flower.
   r += sin(n.y * 7.0 + t * 1.6 + flow * 3.1) * 0.0035 * (0.5 + uLevel);
@@ -90,7 +88,7 @@ float fluidRadius(vec3 n) {
   r += pow(lobeA, 5.0) * (0.012 + uBass * 0.035);
   r += pow(lobeB, 5.0) * (0.008 + uMid * 0.022);
 
-  return min(r, 1.31);
+  return min(r, 1.32);
 }
 
 float mapLiquid(vec3 p) {
@@ -119,8 +117,8 @@ void main() {
   vec3 uu = normalize(cross(vec3(0.0, 1.0, 0.0), ww));
   vec3 vv = cross(ww, uu);
   vec2 screen = vUv * 2.0 - 1.0;
-  // 0.3 -> 0.25：去掉水晶球后液体外面那圈空白偏大，镜头稍微推近，
-  // 让磁流体在画布里占得更满（不改液体本身的尺寸与形态）。
+  // 0.25 让半径 0.91 的液体在画布里保持充足的体量；水晶球去掉后，
+  // 不再需要为外壳留出取景空白。镜头推进只影响取景，不改变 SDF。
   const float tanHalf = 0.25;
   vec3 rd = normalize(ww + screen.x * tanHalf * uu + screen.y * tanHalf * vv);
 
@@ -162,7 +160,7 @@ void main() {
   vec3 N = calcNormal(p);
   vec3 Nv = vec3(dot(N, uu), dot(N, vv), dot(N, -ww));
   vec2 muv = Nv.xy * 0.5 + 0.5;
-  vec3 color = texture2D(uMatcap, muv).rgb * 0.72;
+  vec3 color = texture2D(uMatcap, muv).rgb * 0.56;
 
   float ndvL = max(dot(N, -rd), 0.0);
   float rim = pow(1.0 - ndvL, 3.0);
@@ -186,7 +184,7 @@ void main() {
   color += iridescence * edge * 0.02;
 
   float vein = smoothstep(0.5, 0.94, sin(p.y * 15.0 + p.x * 3.0 + uTime * 0.8) * 0.5 + 0.5);
-  color += vein * uLevel * vec3(0.005, 0.007, 0.01) * 0.45;
+  color += vein * (uLevel * 0.45 + uTreble * 0.18) * vec3(0.005, 0.007, 0.01);
 
   color *= mix(0.52, 1.0, smoothstep(-0.9, 0.35, N.y));
 

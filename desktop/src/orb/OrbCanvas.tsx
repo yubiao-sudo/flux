@@ -162,9 +162,9 @@ export function OrbCanvas({ state, audio }: Props) {
     const matcapTexture = createMatcapTexture();
 
     const drops = [
-      new THREE.Vector3(1.08, 0.28, 0.26),
-      new THREE.Vector3(-0.82, 0.72, 0.36),
-      new THREE.Vector3(0.48, -0.76, 0.42),
+      new THREE.Vector3(1.16, 0.28, 0.26),
+      new THREE.Vector3(-0.9, 0.72, 0.36),
+      new THREE.Vector3(0.52, -0.82, 0.42),
     ];
     const dropRadii = new Float32Array([0.062, 0.04, 0.03]);
 
@@ -225,7 +225,7 @@ export function OrbCanvas({ state, audio }: Props) {
     const reduceMotion =
       typeof window !== 'undefined' &&
       window.matchMedia?.('(prefers-reduced-motion: reduce)').matches === true;
-    if (reduceMotion) flowTime = 4.2;
+    if (reduceMotion) flowTime = 1.6;
 
     const renderFrame = (now: number) => {
       if (!active) return;
@@ -284,9 +284,9 @@ export function OrbCanvas({ state, audio }: Props) {
       }
 
       const dropOrbit = [
-        { distance: 1.08, speed: 0.11, phase: 0.5, height: 0.3 },
-        { distance: 1.14, speed: -0.08, phase: 2.7, height: 0.68 },
-        { distance: 1.03, speed: 0.14, phase: 4.2, height: -0.5 },
+        { distance: 1.16, speed: 0.11, phase: 0.5, height: 0.3 },
+        { distance: 1.22, speed: -0.08, phase: 2.7, height: 0.68 },
+        { distance: 1.09, speed: 0.14, phase: 4.2, height: -0.5 },
       ];
       dropOrbit.forEach((drop, index) => {
         const angle = flowTime * drop.speed + drop.phase;

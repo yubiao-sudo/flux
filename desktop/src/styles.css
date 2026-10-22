@@ -525,7 +525,7 @@ textarea {
 .orb-stage:focus-visible::after {
   content: '';
   position: absolute;
-  inset: 56px;
+  inset: 40px;
   border: 1px solid rgba(205, 227, 228, 0.35);
   border-radius: 50%;
   pointer-events: none;
@@ -567,39 +567,6 @@ textarea {
 .orb-stage:hover .orb-aura {
   opacity: 1;
   transform: translate(-50%, -50%) scale(1.04);
-}
-
-.orb-halo {
-  position: absolute;
-  z-index: 1;
-  top: 50%;
-  left: 50%;
-  width: 69%;
-  height: 69%;
-  transform: translate(-50%, -50%);
-  border-radius: 50%;
-  pointer-events: none;
-  opacity: 0;
-  background: radial-gradient(
-    circle,
-    transparent 58%,
-    rgba(198, 223, 226, 0.06) 63%,
-    transparent 70%
-  );
-  filter: blur(7px);
-  transition: opacity 1s ease;
-  animation: halo-turn 28s linear infinite;
-}
-
-.app[data-state='listening'] .orb-halo,
-.app[data-state='thinking'] .orb-halo {
-  opacity: 1;
-}
-
-@keyframes halo-turn {
-  to {
-    transform: translate(-50%, -50%) rotate(360deg);
-  }
 }
 
 .orb-canvas {
@@ -654,7 +621,7 @@ textarea {
   z-index: 1;
   left: 50%;
   bottom: 11%;
-  width: 47%;
+  width: 66%;
   height: 5%;
   transform: translateX(-50%);
   border-radius: 50%;
@@ -675,8 +642,8 @@ textarea {
   z-index: 0;
   left: 50%;
   top: 50%;
-  width: 52%;
-  height: 52%;
+  width: 68%;
+  height: 68%;
   border-radius: 50%;
   transform: translate(-50%, -50%);
   box-shadow: 0 0 80px rgba(155, 193, 197, 0);
@@ -7058,7 +7025,6 @@ html[data-tauri='true'] .window-chrome {
 
   /* 流体由 WebGL 单独处理（OrbCanvas 只画一帧），这里只去掉模糊光晕的呼吸 */
   .orb-aura,
-  .orb-halo,
   .orb-state-aura {
     animation: none !important;
   }

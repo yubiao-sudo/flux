@@ -1385,7 +1385,6 @@ export function App() {
             }}
           >
             <span className="orb-aura" aria-hidden="true" />
-            <span className="orb-halo" aria-hidden="true" />
             <OrbCanvas state={voiceState} audio={audio} />
             <span className="orb-floor" aria-hidden="true" />
             <span className="orb-state-aura" aria-hidden="true" />
