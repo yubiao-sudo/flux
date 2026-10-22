@@ -69,7 +69,9 @@ float fluidRadius(vec3 n) {
   for (int i = 0; i < 8; i++) {
     float a = max(dot(n, uDirs[i]), 0.0);
     float peak = pow(a, 36.0) * 0.28 + pow(a, 80.0) * 0.18;
-    float pulse = 0.55 + 0.45 * sin(t * (0.55 + float(i) * 0.17) + float(i) * 2.1 + flow * 1.4);
+    float breathe = 0.5 + 0.5 * sin(t * (0.55 + float(i) * 0.17) + float(i) * 2.1 + flow * 1.4);
+    float pulse = 0.18 + 0.82 * breathe * breathe * (3.0 - 2.0 * breathe);
+    pulse = mix(pulse, 1.0, uSpeaking * 0.55);
     r += uAmps[i] * peak * pulse * (0.4 + uMid * 0.9 + uSpeaking * 0.35);
   }
 
