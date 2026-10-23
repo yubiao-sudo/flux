@@ -30,6 +30,7 @@ function extract(name) {
 const FIND = extract('FIND_BY_TEXT_JS');
 const SCAN = extract('SCAN_JS');
 const MARK = extract('MARK_SELECTOR_JS');
+const SCROLL = extract('SCROLL_SELECTOR_JS');
 const STYLE_FN = extract('MARK_STYLE_FN');
 const CSS_PATH = extract('CSS_PATH_FN');
 const PIERCE = extract('PIERCE_HELPERS_JS');
@@ -56,20 +57,33 @@ function markScript(sel) {
   js = replaceAll(js, '__BAIZE_DEEP__', PIERCE);
   return js;
 }
+function scrollScript(sel) {
+  let js = SCROLL;
+  js = replaceAll(js, '__BAIZE_SEL__', JSON.stringify(sel));
+  js = replaceAll(js, '__BAIZE_DEEP__', PIERCE);
+  return js;
+}
 
-// ── 2. 夹具：shadow DOM + 同源 iframe（iframe 里再套一层 shadow DOM） ─────
+// ── 2. 夹具：shadow DOM + 同源 iframe（iframe 里再套一层 shadow DOM），
+//        三个位置各放一个折叠线以下的元素供定位式滚动断言 ──────────────────
 const MAIN_HTML = `<!doctype html><meta charset="utf-8">
 <style>body{margin:0}#frame{width:420px;height:300px;border:4px solid #333;padding:8px;margin-top:10px}</style>
 <button id="plain" onclick="window.__clickedPlain=true">普通按钮</button>
 <div id="host"></div>
+<iframe id="frame" src="/inner"></iframe>
+<div id="host3"></div>
+<div style="height:1500px"></div>
+<button id="lowBtn" onclick="window.__clickedPlain=true">页面底部按钮</button>
 <script>
   document.getElementById('host').attachShadow({mode:'open'}).innerHTML='<button id="sb">影子按钮</button>';
   document.getElementById('host').shadowRoot.getElementById('sb').onclick=function(){window.parent.__clickedShadow=true;};
-</script>
-<iframe id="frame" src="/inner"></iframe>`;
+  document.getElementById('host3').attachShadow({mode:'open'}).innerHTML='<div style="height:1200px"></div><button id="sb2">深层影子按钮</button>';
+</script>`;
 const INNER_HTML = `<!doctype html><meta charset="utf-8"><style>body{margin:0;padding:0}</style>
 <button id="fb" style="margin-top:20px">框架按钮</button>
 <div id="host2"></div>
+<div style="height:600px"></div>
+<button id="fb2">内层底部按钮</button>
 <script>
   document.getElementById('host2').attachShadow({mode:'open'}).innerHTML='<button id="nb">嵌套按钮</button>';
   document.getElementById('fb').onclick=function(){window.parent.__frameClicked=true;};
@@ -230,6 +244,22 @@ async function main() {
     if (srect) { await realClick(srect); await new Promise((r) => setTimeout(r, 300)); }
     check('真实点击：shadow DOM 内按钮收到事件',
       await B.evaluate('window.__clickedShadow===true'));
+
+    // ── 定位式滚动（放在最后：滚动会移走视口） ──
+    // 容差 -3px：scrollIntoView('nearest') 把元素对齐到视口顶边时有亚像素舍入
+    const vh = await B.evaluate('window.innerHeight');
+    const inView = (arr) => arr && arr[4] === true && arr[1] >= -3 && arr[1] < vh;
+    // 顶层文档折叠线以下的元素（回归：旧行为不变）
+    const low = parse(await B.evaluate(scrollScript('#lowBtn')));
+    check('滚动：顶层文档元素滚入视口', inView(low), JSON.stringify(low));
+    // 主文档 shadow root 内的元素（顶层 querySelector 根本找不到，必须穿透）
+    const sb2 = parse(await B.evaluate(scrollScript('#sb2')));
+    check('滚动：shadow DOM 内元素穿透滚入视口', inView(sb2), JSON.stringify(sb2));
+    // iframe 内折叠线以下的元素（内层滚动 + 顶层坐标换算）
+    const fb2 = parse(await B.evaluate(scrollScript('#fb2')));
+    check('滚动：iframe 内元素滚入内层视口并换算到顶层', inView(fb2), JSON.stringify(fb2));
+    const noSel = await B.evaluate(scrollScript('#不存在'));
+    check('滚动：选择器无命中返回 null', noSel === 'null', String(noSel));
   } finally {
     try { B.ws.close(); } catch {}
     try { B.child.kill(); } catch {}

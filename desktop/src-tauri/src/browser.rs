@@ -778,17 +778,29 @@ if(!(r.width>=2&&r.height>=2))return 'null';
 __baizeMark(r.left,r.top,r.width,r.height,__BAIZE_HOLD__);
 return JSON.stringify([r.left,r.top,r.width,r.height]);})()"#;
 
-/// 定位式滚动：把目标元素滚到视口内（已经可见就不动），返回它滚动后的矩形。
+/// 定位式滚动：把目标元素滚到视口内（已经可见就不动），返回它滚动后的矩形
+/// （顶层视口 CSS 像素）。
+/// 选择器解析**顶层文档优先**（旧行为不变），找不到再下钻开放 shadowRoot 与
+/// 同源 iframe——内嵌表单里的字段也能定位式滚。是否在视口外的判定用换算后的
+/// 顶层矩形（iframe 内元素的原始 rect 相对内嵌视口，不能直接比）；
+/// scrollIntoView 沿 frame 链连内层滚动容器一起滚，滚完重取矩形再换算一次。
 /// 「滚动」应该是**为了找东西/让目标可见**才发生，而不是盲滚固定像素——
 /// 盲滚会把页面丢到用户没在看的位置，还得再滚回来。
+/// 返回 `JSON.stringify([left,top,width,height,need,scrollY])`。
 const SCROLL_SELECTOR_JS: &str = r#"(function(){
 if(typeof document==='undefined'||!document.documentElement)return 'null';
-var e=document.querySelector(__BAIZE_SEL__);
+__BAIZE_DEEP__
+var sel=__BAIZE_SEL__;
+var e=null;
+var roots=baizeDeepRoots(null);
+for(var i=0;i<roots.length&&!e;i++){
+  try{e=roots[i].querySelector(sel);}catch(err){}
+}
 if(!e)return 'null';
-var r=e.getBoundingClientRect();
+var r=baizeToTopRect(e,e.getBoundingClientRect());
 var need=(r.top<-2||r.bottom>innerHeight+2||r.left<-2||r.right>innerWidth+2);
 if(need){try{e.scrollIntoView({block:'nearest',inline:'nearest'});}catch(err){}
-  r=e.getBoundingClientRect();}
+  r=baizeToTopRect(e,e.getBoundingClientRect());}
 return JSON.stringify([r.left,r.top,r.width,r.height,need,window.scrollY||0]);})()"#;
 
 /// DOM 文字定位脚本：**一次 evaluate，没有截图、没有 OCR、没有视觉模型**。
@@ -5476,7 +5488,9 @@ impl Tool for BrowserActTool {
                 if let Some(sel) = args["selector"].as_str() {
                     let lit = serde_json::to_string(sel)
                         .map_err(|e| format!("选择器解析失败: {e}"))?;
-                    let js = SCROLL_SELECTOR_JS.replace("__BAIZE_SEL__", &lit);
+                    let js = SCROLL_SELECTOR_JS
+                        .replace("__BAIZE_SEL__", &lit)
+                        .replace("__BAIZE_DEEP__", PIERCE_HELPERS_JS);
                     let raw = tab.evaluate(&js, false).map_err(|e| format!("滚动失败: {e}"))?;
                     let s = raw
                         .value
