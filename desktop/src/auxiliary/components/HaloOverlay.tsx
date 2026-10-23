@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { getHaloLast, haloOverlayReady, logFrontend, onHaloEvent } from "../api";
+import { getHaloLast, haloOverlayReady, logFrontend, onHaloEvent } from "../../engine/api";
 
 /**
  * 目标应用光圈覆盖层：全屏透明穿透置顶窗，渲染三类视觉标记——

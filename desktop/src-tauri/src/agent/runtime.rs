@@ -942,6 +942,19 @@ impl<'a> AgentLoop<'a> {
                     let Some(task) = args["task"].as_str().map(|s| s.to_string()) else {
                         continue;
                     };
+                    // 并行预执行只收「必然放行」的只读子代理：
+                    // general-purpose（HighRisk）和命中拒绝规则的派发不能在这里跑完，
+                    // 否则审批就发生在工作完成之后——审批卡成了走过场。
+                    let class = crate::subagent::spawn_permission_class(&args);
+                    if class != crate::tools::PermissionClass::ReadOnly {
+                        continue;
+                    }
+                    if !matches!(
+                        self.state.security.classify("spawn_subagent", &args, class),
+                        PermissionDecision::AutoAllow
+                    ) {
+                        continue;
+                    }
                     spawn_specs.push((call_id, agent_type, task));
                 }
                 if spawn_specs.len() > 1 {
@@ -1083,7 +1096,13 @@ impl<'a> AgentLoop<'a> {
                         continue;
                     }
                 };
-                let class = tool.permission();
+                let class = if name == "spawn_subagent" {
+                    // general-purpose 子代理可执行命令/写文件：派发本身按高危审批，
+                    // 子代理内部每次工具调用还会再过一遍 SecurityManager（双重闸门）
+                    crate::subagent::spawn_permission_class(&args)
+                } else {
+                    tool.permission()
+                };
                 // 回退原则第 2 级：破坏性点击目标（删除/清空/卸载/发送…）强制高危审批，
                 // 即使工具本身声明为只读——不可逆操作必须逐次经用户确认
                 let args_text = args.to_string();

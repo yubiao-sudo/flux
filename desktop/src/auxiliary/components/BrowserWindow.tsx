@@ -10,8 +10,8 @@ import {
   onBrowserUpdate,
   openUrlTab,
   switchBrowserTab,
-} from "../api";
-import type { BrowserState, SearchResult, SearchTrace, Tab } from "../types";
+} from "../../engine/api";
+import type { BrowserState, SearchResult, SearchTrace, Tab } from "../../engine/types";
 
 /** 已自动转交受控浏览器的标签页（键：tabId|url）。 */
 const handedOff = new Set<string>();

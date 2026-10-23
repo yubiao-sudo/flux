@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { getStepLog, onStepPush } from "../api";
+import { getStepLog, onStepPush } from "../../engine/api";
 
 type Step = { id: number; text: string };
 

@@ -14,8 +14,8 @@ import {
   openWebviewWindow,
   saveMarkdown,
   switchMarkdownTab,
-} from '../api';
-import type { MarkdownDoc } from '../types';
+} from '../../engine/api';
+import type { MarkdownDoc } from '../../engine/types';
 
 const CHUNK = 3;
 const INTERVAL = 20;
@@ -164,7 +164,8 @@ export default function MarkdownWindow() {
   useEffect(() => {
     const el = bodyRef.current;
     if (!el) return;
-    if (activeDoc?.streaming) {
+    // 「流式」由本组件的打字机渐显定义（shown < 全文），后端 MarkdownDoc 没有该字段
+    if (!done) {
       wasStreamingRef.current = true;
       if (followRef.current) el.scrollTop = el.scrollHeight;
       return;
@@ -173,7 +174,7 @@ export default function MarkdownWindow() {
       wasStreamingRef.current = false;
       el.scrollTo({ top: 0, behavior: 'smooth' });
     }
-  }, [renderedChars, activeDoc?.streaming]);
+  }, [renderedChars, done]);
 
   const html = useMemo(() => {
     const md = target.slice(0, renderedChars);

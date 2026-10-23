@@ -278,7 +278,7 @@ impl SecurityManager {
 }
 
 /// 计算权限记忆的「情况指纹」：让「记住」只作用于相同具体情况。
-/// 软件管家类工具细化到「软件 + 目标盘」，不同软件/不同盘符独立记忆、互不覆盖；
+/// 软件管家类工具细化到「软件 + 目标盘」，网络类工具细化到「主机/连接」，
 /// 其余工具回退到工具名整体记忆（保持原有行为）。
 fn context_key(tool: &str, args: &Value) -> String {
     match tool {
@@ -294,7 +294,60 @@ fn context_key(tool: &str, args: &Value) -> String {
             let id = args["id"].as_str().unwrap_or("").to_string();
             format!("software_uninstall|id={id}")
         }
+        // HighRisk + 整体记忆会让一次「记住允许」放行所有出站请求：
+        // 细化到主机，允许 api.a.com 不会顺带允许 api.b.com
+        "http_request" => {
+            let host = url_host(args["url"].as_str().unwrap_or(""))
+                .unwrap_or_else(|| "unknown".to_string());
+            format!("http_request|host={host}")
+        }
+        // 连接串可能带密码，不能进规则（规则会持久化并展示在白名单里）：
+        // 别名原样保留，完整连接串压缩为 scheme://host
+        "db_query" => {
+            format!("db_query|{}", conn_key(args["connection"].as_str().unwrap_or("")))
+        }
         _ => tool.to_string(),
+    }
+}
+
+/// 从 URL 提取主机名（小写）；解析不出返回 None
+fn url_host(url: &str) -> Option<String> {
+    let after_scheme = url.split_once("://")?.1;
+    let authority = after_scheme.split(['/', '?', '#']).next()?;
+    let host = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
+    let host = if host.starts_with('[') {
+        // IPv6 字面量 [::1]:8080
+        host.trim_start_matches('[').split(']').next()?
+    } else {
+        host.split(':').next()?
+    };
+    let host = host.trim();
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_ascii_lowercase())
+    }
+}
+
+/// 连接串的「情况指纹」：别名（db_connections 里配置的名字）原样保留；
+/// 完整连接串压缩为 scheme://host，避免密码进入权限规则。
+/// 解析不出主机时退化为散列，保证不同连接串不互相覆盖。
+fn conn_key(connection: &str) -> String {
+    let trimmed = connection.trim();
+    if !trimmed.contains("://") {
+        return trimmed.to_string();
+    }
+    match url_host(trimmed) {
+        Some(host) => {
+            let scheme = trimmed.split("://").next().unwrap_or("");
+            format!("{scheme}://{host}")
+        }
+        None => {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            trimmed.hash(&mut h);
+            format!("conn#{:016x}", h.finish())
+        }
     }
 }
 
@@ -431,6 +484,48 @@ mod policy_tests {
             p.decide("anything", PermissionClass::Write),
             Some(PolicyAction::Deny)
         );
+    }
+
+    /// http_request 的记忆指纹必须细化到主机：放行一个主机不能顺带放行另一个，
+    /// 同一主机的不同路径共享记忆；连接串指纹不能携带密码。
+    #[test]
+    fn network_context_keys_are_host_scoped_and_password_free() {
+        let key_a = context_key("http_request", &json!({ "url": "https://api.a.com/v1/x?y=1" }));
+        let key_a2 = context_key("http_request", &json!({ "url": "https://api.a.com/other" }));
+        let key_b = context_key("http_request", &json!({ "url": "https://api.b.com/v1/x" }));
+        let key_user = context_key("http_request", &json!({ "url": "https://key@api.a.com/v1" }));
+        let key_port = context_key("http_request", &json!({ "url": "http://api.a.com:8443/x" }));
+        assert_eq!(key_a, "http_request|host=api.a.com");
+        assert_eq!(key_a, key_a2, "同主机不同路径共享记忆");
+        assert_ne!(key_a, key_b, "不同主机必须独立记忆");
+        assert_eq!(key_user, key_a, "userinfo 不参与主机指纹");
+        assert_eq!(key_port, key_a, "端口不参与主机指纹");
+        assert_eq!(
+            context_key("http_request", &json!({})),
+            "http_request|host=unknown"
+        );
+
+        // 别名原样保留（可读），完整连接串压缩为 scheme://host（密码不入规则）
+        assert_eq!(context_key("db_query", &json!({ "connection": "flux" })), "db_query|flux");
+        let key = context_key(
+            "db_query",
+            &json!({ "connection": "mysql://user:secret@db.host.com:3306/app" }),
+        );
+        assert_eq!(key, "db_query|mysql://db.host.com");
+        assert!(!key.contains("secret"), "密码不能进入权限规则: {key}");
+        // 解析不出的连接串退化为散列，不同串互不覆盖
+        let k1 = context_key("db_query", &json!({ "connection": "://weird" }));
+        let k2 = context_key("db_query", &json!({ "connection": "://weird2" }));
+        assert_ne!(k1, k2);
+    }
+
+    /// URL 主机提取：大小写归一、IPv6 字面量、无 scheme、空主机
+    #[test]
+    fn url_host_extraction() {
+        assert_eq!(url_host("https://Example.COM/path").as_deref(), Some("example.com"));
+        assert_eq!(url_host("http://[::1]:8080/x").as_deref(), Some("::1"));
+        assert_eq!(url_host("no-scheme-host").is_some(), false, "无 scheme 的串不猜主机");
+        assert_eq!(url_host("https:///path"), None, "空主机返回 None");
     }
 }
 

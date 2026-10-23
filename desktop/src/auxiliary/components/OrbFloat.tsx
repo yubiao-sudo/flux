@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
-import type { ThoughtEvent } from "../types";
+import type { ThoughtEvent } from "../../engine/types";
 
 /**
  * 桌面悬浮球（#/orb 独立透明窗口）：

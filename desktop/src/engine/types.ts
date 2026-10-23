@@ -355,6 +355,24 @@ export interface SearchResult {
   summary: string;
 }
 
+/** 一次搜索引擎（Bing/Baidu/DuckDuckGo）的检索尝试，用于结果页的检索轨迹 */
+export interface SearchAttempt {
+  engine: string;
+  status: "running" | "ok" | "failed";
+  count: number;
+  detail?: string | null;
+}
+
+/** 一次 agent 搜索的完整轨迹：改写查询 → 并行检索 → 去重重排 */
+export interface SearchTrace {
+  query: string;
+  stage: "planning" | "querying" | "ranking" | "done" | "failed";
+  attempts: SearchAttempt[];
+  result_count: number;
+  started_ms: number;
+  elapsed_ms: number;
+}
+
 // 内置浏览器标签页的内嵌可用性判定（打开网址时对响应头探测得出，非启发式猜测）
 export interface EmbedCheck {
   /** ok=可正常内嵌 | blocked=确定被拒绝/不适用内嵌 | unknown=探测失败，需回退启发式 */
@@ -381,6 +399,8 @@ export interface BrowserState {
   html: string | null;
   title: string;
   results?: SearchResult[] | null;
+  /** 最近一次 agent 搜索的检索轨迹（结果页渲染检索过程用） */
+  search?: SearchTrace | null;
   tabs?: Tab[];
 }
 

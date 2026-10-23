@@ -16,5 +16,5 @@
     "noUnusedParameters": false
   },
   "include": ["src", "vite.config.ts"],
-  "exclude": ["src/auxiliary", "src/aux-main.jsx"]
+  "exclude": ["src/aux-main.jsx"]
 }

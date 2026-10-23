@@ -1417,7 +1417,9 @@ impl Tool for HttpRequestTool {
         })
     }
     fn permission(&self) -> PermissionClass {
-        PermissionClass::ReadOnly
+        // 任意 method + 自定义 header 的出站 HTTP：能向任何端点 POST/DELETE，
+        // 是现成的数据外传通道，不能按只读自动放行——始终审批（可按主机「记住允许」）
+        PermissionClass::HighRisk
     }
     fn run(&self, args: Value) -> Result<Value, String> {
         let method = args["method"].as_str().unwrap_or("GET").to_uppercase();
@@ -2204,7 +2206,9 @@ impl Tool for DbQueryTool {
         })
     }
     fn permission(&self) -> PermissionClass {
-        PermissionClass::ReadOnly
+        // 连接串可指向任意主机，且 SQL 原样下发（db_rows 不做 SELECT 校验，
+        // 查询文本本身就能携带本地数据外发给远端服务器）——不是只读语义，始终审批
+        PermissionClass::HighRisk
     }
     fn run(&self, args: Value) -> Result<Value, String> {
         let input = args["connection"].as_str().ok_or("缺少参数 connection")?;

@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
-import { onTermData, termClose, termResize, termSpawn, termWrite } from '../api';
+import { onTermData, termClose, termResize, termSpawn, termWrite } from '../../engine/api';
 
 const FLUX_TERM = {
   background: '#050607',

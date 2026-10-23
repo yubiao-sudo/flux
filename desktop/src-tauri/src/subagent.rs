@@ -9,12 +9,14 @@
 //!   - general-purpose: 通用编码任务（完整工具集），可读写文件
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::model::{ChatMessage, ModelRouter};
+use crate::security::{AuditEntry, PermissionDecision, SecurityManager};
 use crate::tools::{global_cancelled, PermissionClass, Tool, ToolRegistry};
 
 // ───────────────── 执行流透出 ─────────────────
@@ -40,6 +42,11 @@ impl SubAgentTrace {
         if let Some(state) = app.try_state::<crate::AppState>() {
             state.log_thought(kind, &label, &detail);
         }
+    }
+
+    /// 权限审批需要向主窗口发事件，复用 trace 持有的应用句柄
+    fn app_handle(&self) -> Option<&AppHandle> {
+        self.app.as_ref()
     }
 }
 
@@ -73,6 +80,15 @@ impl SubAgentType {
             SubAgentType::Search => "搜索",
             SubAgentType::CodeExplorer => "代码探索",
             SubAgentType::GeneralPurpose => "通用任务",
+        }
+    }
+
+    /// 审计与持久化用的稳定标识（与 serde rename 一致）
+    fn slug(&self) -> &'static str {
+        match self {
+            SubAgentType::Search => "search",
+            SubAgentType::CodeExplorer => "code-explorer",
+            SubAgentType::GeneralPurpose => "general-purpose",
         }
     }
 
@@ -174,6 +190,172 @@ fn subagent_slots() -> &'static tokio::sync::Semaphore {
     SLOTS.get_or_init(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_SUBAGENTS))
 }
 
+// ───────────────── 权限：子代理与主 Agent 走同一套 SecurityManager ─────────────────
+//
+// 之前子代理直接调 tools.run，绕过了整个权限体系——general-purpose 白名单里有
+// run_command / write_file，主 Agent 一次 spawn_subagent 就能无审批执行任意命令。
+// 现在每次子代理工具调用都过 classify；需要人工审批时走与主循环相同的
+// 前端审批卡 + IM 推送 + 升级通知链，等不到批准按拒绝处理，并全部落审计。
+
+/// 子代理内审批等待上限。
+///
+/// 故意比主循环的 15 分钟短：spawn_subagent 被派发层 600s 工具超时罩着，
+/// 等太久整个子代理会先被外层超时丢弃，用户批准了也没有效果。
+/// 用户就在发起任务的会话旁边（否则不会触发子代理），2 分钟足够响应。
+const SUBAGENT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
+
+fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+fn audit_subagent_call(
+    store: Option<&crate::memory::MemoryStore>,
+    agent_type: SubAgentType,
+    tool_name: &str,
+    args: &Value,
+    decision: &str,
+    result: &Value,
+) {
+    let Some(store) = store else { return };
+    let entry = AuditEntry {
+        ts: now_ms(),
+        subject: format!("subagent:{}", agent_type.slug()),
+        tool: tool_name.to_string(),
+        args: args.clone(),
+        decision: decision.to_string(),
+        result: result.to_string(),
+    };
+    if let Err(e) = store.add_audit(&entry) {
+        eprintln!("[子代理] 写审计失败: {e}");
+    }
+}
+
+/// 工具执行统一放 blocking 线程池：子代理跑在 async 上下文里，
+/// 直接调 tools.run 会阻塞 tokio worker 线程（run_command 一次就是几秒）。
+async fn run_tool_blocking(tools: &ToolRegistry, tool_name: &str, args: &Value) -> Value {
+    let Some(tool) = tools.get(tool_name) else {
+        return json!({ "error": format!("工具不存在: {tool_name}") });
+    };
+    let args = args.clone();
+    match tokio::task::spawn_blocking(move || tool.run(args)).await {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => json!({ "error": e }),
+        Err(e) => json!({ "error": format!("工具执行失败: {e}") }),
+    }
+}
+
+/// 审批等待：与主循环 wait_for_decision_with_escalation 相同的
+/// 「升级通知 + 轮询决策」结构，但上限取 SUBAGENT_APPROVAL_TIMEOUT。
+async fn wait_subagent_decision(
+    app: &AppHandle,
+    security: &SecurityManager,
+    escalation: &Arc<crate::notify::EscalationManager>,
+    cancel: &std::sync::atomic::AtomicBool,
+    id: &str,
+    what: &str,
+    detail: &str,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    let _ = escalation.start_escalation(app, id, what, detail);
+    let deadline = tokio::time::Instant::now() + SUBAGENT_APPROVAL_TIMEOUT;
+    loop {
+        if let Some(d) = security.decision(id) {
+            escalation.cancel_escalation(id);
+            return d;
+        }
+        if cancel.load(Ordering::SeqCst) || global_cancelled() {
+            escalation.cancel_escalation(id);
+            return false;
+        }
+        if tokio::time::Instant::now() > deadline {
+            escalation.cancel_escalation(id);
+            return false; // 超时默认拒绝
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// 一次子代理工具调用的完整链路：classify → （审批）→ 执行 → 审计。
+/// 返回值直接回填给子代理模型的 tool 消息。
+async fn run_subagent_tool_checked(
+    trace: &SubAgentTrace,
+    agent_type: SubAgentType,
+    tool_name: &str,
+    args: &Value,
+    tools: &ToolRegistry,
+    store: Option<&crate::memory::MemoryStore>,
+) -> Value {
+    // 权限检查依赖 AppState（SecurityManager / IM 总线 / 升级通知）。
+    // 拿不到时宁可拒绝：检查缺失不能静默放行。
+    let unavailable = || {
+        let out = json!({"error": "权限检查不可用（应用状态缺失），此调用已拒绝"});
+        audit_subagent_call(store, agent_type, tool_name, args, "denied", &out);
+        out
+    };
+    let Some(app) = trace.app_handle().cloned() else {
+        return unavailable();
+    };
+    let Some(state) = app.try_state::<crate::AppState>() else {
+        return unavailable();
+    };
+
+    // 白名单已由调用方过滤；这里取工具声明的权限级别，未知工具按高危处理
+    let class = tools
+        .get(tool_name)
+        .map(|t| t.permission())
+        .unwrap_or(PermissionClass::HighRisk);
+
+    match state.security.classify(tool_name, args, class) {
+        PermissionDecision::AutoAllow => {
+            let out = run_tool_blocking(tools, tool_name, args).await;
+            audit_subagent_call(store, agent_type, tool_name, args, "auto-allow", &out);
+            out
+        }
+        PermissionDecision::AutoDeny => {
+            let out = json!({"error": "用户此前已记住拒绝此类操作，本次自动拒绝"});
+            audit_subagent_call(store, agent_type, tool_name, args, "denied", &out);
+            out
+        }
+        PermissionDecision::Prompt(req) => {
+            trace.emit(
+                "subagent",
+                format!("子代理[{}] 请求审批 · {}", agent_type.label(), tool_name),
+                trunc(&args.to_string(), 240).to_string(),
+            );
+            let _ = app.emit("permission-request", &req);
+            let what = format!("子代理[{}]请求使用工具 {}", agent_type.label(), tool_name);
+            let detail = trunc(&args.to_string(), 400).to_string();
+            let channels = state.im_bus.push_approval(&req.id, &what, &detail).await;
+            let _ = app.emit(
+                "permission-channel",
+                json!({ "approval_id": req.id, "channels": channels }),
+            );
+            let approved = wait_subagent_decision(
+                &app,
+                &state.security,
+                &state.escalation,
+                state.cancel.as_ref(),
+                &req.id,
+                &what,
+                &detail,
+            )
+            .await;
+            if approved {
+                let out = run_tool_blocking(tools, tool_name, args).await;
+                audit_subagent_call(store, agent_type, tool_name, args, "approved", &out);
+                out
+            } else {
+                let out = json!({"error": "用户未批准此操作（拒绝或超时）。请改用其他方式完成任务，或在摘要中说明该步骤未能执行"});
+                audit_subagent_call(store, agent_type, tool_name, args, "denied", &out);
+                out
+            }
+        }
+    }
+}
+
 // ───────────────── 子代理执行器 ─────────────────
 
 /// 启动一个子代理，执行任务并返回结果（内部步骤经 trace 透出到执行流）
@@ -207,7 +389,7 @@ pub async fn run_subagent(
     let limit = std::time::Duration::from_secs(subagent_timeout_secs(&agent_type));
     let result = match tokio::time::timeout(
         limit,
-        run_subagent_inner(agent_type, task, model, tools, trace),
+        run_subagent_inner(agent_type, task, model, tools, trace, store.as_deref()),
     )
     .await
     {
@@ -268,6 +450,7 @@ async fn run_subagent_inner(
     model: &ModelRouter,
     tools: &ToolRegistry,
     trace: &SubAgentTrace,
+    store: Option<&crate::memory::MemoryStore>,
 ) -> SubAgentResult {
     let start = std::time::Instant::now();
     let system_prompt = agent_type.system_prompt();
@@ -352,9 +535,8 @@ async fn run_subagent_inner(
                 );
 
                 let result = if allowed.contains(&tool_name) {
-                    tools.run(tool_name, args.clone()).unwrap_or_else(|e| {
-                        json!({"error": e})
-                    })
+                    run_subagent_tool_checked(trace, agent_type, tool_name, &args, tools, store)
+                        .await
                 } else {
                     json!({"error": format!("子代理类型 {} 不允许使用工具 {}", agent_type.label(), tool_name)})
                 };
@@ -520,7 +702,10 @@ impl Tool for SpawnSubAgentTool {
         })
     }
     fn permission(&self) -> PermissionClass {
-        PermissionClass::ReadOnly // 子代理本身是只读的（general-purpose 也由主 Agent 审批）
+        // 基础级别：search / code-explorer 是纯只读，自动放行。
+        // general-purpose 会被 runtime 侧的 spawn_permission_class 升级为 HighRisk，
+        // 且子代理内部每次工具调用还会再过一遍 SecurityManager（双重闸门）。
+        PermissionClass::ReadOnly
     }
     fn run(&self, args: Value) -> Result<Value, String> {
         let agent_type = parse_agent_type(&args)?;
@@ -545,6 +730,20 @@ impl Tool for SpawnSubAgentTool {
             "files_examined": result.files_examined,
             "duration_ms": result.duration_ms,
         }))
+    }
+}
+
+/// spawn_subagent 的权限级别（主循环派发时用）：
+/// general-purpose 子代理可执行命令 / 写文件，派发本身必须经用户审批（HighRisk）；
+/// search / code-explorer 只读，保持自动放行。
+///
+/// 这不是可有可无的形式主义：子代理内部的白名单对 general-purpose 包含
+/// run_command / write_file / edit_file / move_file，如果不审批派发动作，
+/// 用户甚至不知道一个有写能力的子代理已经启动了。
+pub fn spawn_permission_class(args: &Value) -> PermissionClass {
+    match parse_agent_type(args) {
+        Ok(SubAgentType::GeneralPurpose) => PermissionClass::HighRisk,
+        _ => PermissionClass::ReadOnly,
     }
 }
 
@@ -674,5 +873,20 @@ mod tests {
         let b = subagent_slots() as *const _;
         assert_eq!(a, b);
         assert_eq!(subagent_slots().available_permits(), MAX_CONCURRENT_SUBAGENTS);
+    }
+
+    /// general-purpose 子代理可执行命令/写文件，派发必须走审批；
+    /// 只读类型保持自动放行，否则「并行搜个代码」也要用户点确认。
+    #[test]
+    fn spawn_permission_escalates_only_general_purpose() {
+        let general = json!({ "subagent_type": "general-purpose", "task": "x" });
+        let search = json!({ "subagent_type": "search", "task": "x" });
+        let explorer = json!({ "subagent_type": "code-explorer", "task": "x" });
+        let broken = json!({});
+        assert_eq!(spawn_permission_class(&general), PermissionClass::HighRisk);
+        assert_eq!(spawn_permission_class(&search), PermissionClass::ReadOnly);
+        assert_eq!(spawn_permission_class(&explorer), PermissionClass::ReadOnly);
+        // 解析失败的参数按只读处理（后续 parse 时会报错），不因权限逻辑崩溃
+        assert_eq!(spawn_permission_class(&broken), PermissionClass::ReadOnly);
     }
 }
