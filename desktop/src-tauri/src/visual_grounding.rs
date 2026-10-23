@@ -36,7 +36,11 @@ pub fn vision_model() -> String {
     if let Some(m) = VISION_MODEL.lock().unwrap().as_ref() {
         return m.clone();
     }
-    std::env::var("BAIZE_VISION_MODEL").unwrap_or_else(|_| "llava".to_string())
+    // 默认视觉模型。曾经默认 llava：它在小 UI 元素上的 grounding 很弱，作为
+    // Set-of-Marks / 坐标回归的兜底经常选错框。qwen2.5vl 对 UI 截图的理解和
+    // 坐标定位显著更好，同为 Ollama 一条 `ollama pull qwen2.5vl` 即可就位。
+    // 可被设置页（runtime.vision_model）或 BAIZE_VISION_MODEL 覆盖。
+    std::env::var("BAIZE_VISION_MODEL").unwrap_or_else(|_| "qwen2.5vl".to_string())
 }
 
 pub fn set_vision_model(m: String) {

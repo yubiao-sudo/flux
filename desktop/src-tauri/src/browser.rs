@@ -757,14 +757,23 @@ return __baizeMark(__BAIZE_X__,__BAIZE_Y__,__BAIZE_W__,__BAIZE_H__,__BAIZE_HOLD_
 /// 返回 `JSON.stringify([left,top,width,height])`，找不到元素或元素退化返回 `"null"`。
 const MARK_SELECTOR_JS: &str = r#"(function(){
 if(typeof document==='undefined'||!document.documentElement)return 'null';
+__BAIZE_DEEP__
 __BAIZE_STYLE__
-var e=document.querySelector(__BAIZE_SEL__);
+var sel=__BAIZE_SEL__;
+// 顶层文档优先查（保持旧行为），找不到再下钻开放 shadowRoot 与同源 iframe——
+// scan 会把编号属性写进内层元素，click_mark 必须能在同样的范围里找回来
+var e=null;
+var roots=baizeDeepRoots(null);
+for(var i=0;i<roots.length&&!e;i++){
+  try{e=roots[i].querySelector(sel);}catch(err){}
+}
 if(!e)return 'null';
-var r=e.getBoundingClientRect();
+var r=baizeToTopRect(e,e.getBoundingClientRect());
 if(!(r.width>=2&&r.height>=2))return 'null';
 // 同样只在元素真的不在视口里时才滚，且只滚最小距离——不为了画一条线去动用户的屏幕
 if(!(r.top>=-2&&r.bottom<=innerHeight+2&&r.left>=-2&&r.right<=innerWidth+2)){
-  try{e.scrollIntoView({block:'nearest',inline:'nearest'});}catch(err){}r=e.getBoundingClientRect();}
+  try{e.scrollIntoView({block:'nearest',inline:'nearest'});}catch(err){}
+  r=baizeToTopRect(e,e.getBoundingClientRect());}
 if(!(r.width>=2&&r.height>=2))return 'null';
 __baizeMark(r.left,r.top,r.width,r.height,__BAIZE_HOLD__);
 return JSON.stringify([r.left,r.top,r.width,r.height]);})()"#;
@@ -787,8 +796,8 @@ return JSON.stringify([r.left,r.top,r.width,r.height,need,window.scrollY||0]);})
 /// 这是 `click_text` / `highlight(target)` 的第一级。原先无论目标是什么都先截全屏图、
 /// 跑一遍 Windows OCR（0.2~0.5s）、命中不了还要再过 Set-of-Marks 或视觉模型（秒级）——
 /// 而「点登录 / 点搜索 / 点下一步」绝大多数在 DOM 里就能唯一定位，一次 evaluate 十几毫秒
-/// 就够，而且比像素识别更准。只有 DOM 里找不到（文字是图片、在 iframe 里、纯图标按钮）
-/// 才回落到原来的 OCR 链。
+/// 就够，而且比像素识别更准。只有 DOM 里找不到（文字是图片、在跨域 iframe 或关闭的
+/// shadowRoot 里、纯图标按钮）才回落到原来的 OCR 链。
 ///
 /// 打分选最像「那个控件」的元素：文本精确匹配 0 分 ＜ aria-label/title/placeholder 精确 1 分
 /// ＜ 文本包含（文本越短越像按钮本身）＜ label/value 包含；
@@ -820,8 +829,87 @@ while(cur&&cur.nodeType===1){
 return parts.join(' > ');
 };"#;
 
+/// Shadow DOM / 同源 iframe 穿透助手（占位符 `__BAIZE_DEEP__`，注入到
+/// FIND_BY_TEXT_JS / SCAN_JS / MARK_SELECTOR_JS 三段脚本）。
+///
+/// 背景：`document.querySelectorAll` 与 `createTreeWalker` 都不跨 shadow 边界、
+/// 也不进 iframe——Web Components / 微前端 / 内嵌表单这类页面上，传统枚举会把
+/// 控件整段漏掉，只能落到 OCR/视觉那条又慢又不稳的链。这里提供三个纯函数：
+///
+///   baizeDeepRoots(scopeEl)  收集「可查询根」：顶层文档、逐层下钻的开放
+///                            shadowRoot、同源 iframe 的 contentDocument。
+///                            scopeEl（scan 的模块容器）非空时只收它内部的根。
+///   baizeToTopRect(el, r)    把 iframe 内元素相对内嵌视口的矩形换算成顶层
+///                            视口坐标（CDP 输入事件与红框覆盖层都活在顶层
+///                            坐标系）；顶层元素原样返回，零开销。
+///   baizeStyle(e)            跨文档安全的 getComputedStyle（iframe 内元素
+///                            必须用它自己 window 的 getComputedStyle，否则
+///                            顶层脚本调用会抛 Illegal invocation）。
+///
+/// 成本：发现 shadow root 需要遍历全部元素查 `.shadowRoot`，2 万元素页面
+/// 约 1~2ms，远低于此前已优化掉的逐元素 rect+computedStyle（数百 ms）。
+/// 关闭的 shadowRoot 与跨域 iframe 拿不到，自动跳过，由 OCR/视觉链兜底——
+/// 行为与旧版一致。穿透定位到的元素没有「从顶层文档出发」的 CSS 路径，
+/// 调用方须返回空 `sel`（locator_cache_store 本就拒绝空选择器，天然兜底）。
+const PIERCE_HELPERS_JS: &str = r#"var baizeDeepRoots=function(scopeEl){
+var roots=[];
+var push=function(r){if(r&&roots.indexOf(r)<0)roots.push(r);};
+var elInside=function(el,anc){
+  if(!anc)return true;
+  var p=el;
+  while(p){
+    if(p===anc)return true;
+    var n=p.parentNode;
+    if(n&&n.host)n=n.host;
+    p=n;
+  }
+  return false;
+};
+var collect=function(root){
+  push(root);
+  try{
+    var all=root.querySelectorAll('*');
+    for(var i=0;i<all.length;i++){
+      var sr=null;
+      try{sr=all[i].shadowRoot||null;}catch(e){}
+      if(sr&&elInside(all[i],scopeEl))collect(sr);
+    }
+  }catch(e){}
+  try{
+    var fr=root.querySelectorAll('iframe,frame');
+    for(var j=0;j<fr.length;j++){
+      if(elInside(fr[j],scopeEl)){
+        try{var d=fr[j].contentDocument;if(d)collect(d);}catch(err){}
+      }
+    }
+  }catch(e){}
+};
+if(scopeEl)collect(scopeEl);else collect(document);
+return roots;};
+var baizeToTopRect=function(el,r){
+  var doc=el&&el.ownerDocument,w=doc&&doc.defaultView;
+  if(!w||w.top===w)return r;
+  var dx=0,dy=0,cur=w;
+  while(cur&&cur.frameElement){
+    var f=cur.frameElement,fr=f.getBoundingClientRect();
+    dx+=fr.left;dy+=fr.top;
+    try{
+      var cs=cur.parent.getComputedStyle(f);
+      dx+=(parseFloat(cs.borderLeftWidth)||0)+(parseFloat(cs.paddingLeft)||0);
+      dy+=(parseFloat(cs.borderTopWidth)||0)+(parseFloat(cs.paddingTop)||0);
+    }catch(e){}
+    cur=cur.parent;
+  }
+  return {left:r.left+dx,top:r.top+dy,right:r.right+dx,bottom:r.bottom+dy,width:r.width,height:r.height};
+};
+var baizeStyle=function(e){
+  var w=e.ownerDocument&&e.ownerDocument.defaultView;
+  try{return w?w.getComputedStyle(e):getComputedStyle(e);}catch(err){return getComputedStyle(e);}
+};"#;
+
 const FIND_BY_TEXT_JS: &str = r#"(function(){
 __BAIZE_CSSPATH__
+__BAIZE_DEEP__
 __BAIZE_STYLE__
 if(typeof document==='undefined'||!document.documentElement)return 'null';
 var want=(__BAIZE_TARGET__||'').toLowerCase();
@@ -846,10 +934,11 @@ var scoreOf=function(e){
 };
 var consider=function(e,score){
   if(score>=99)return;
-  var r=e.getBoundingClientRect();
+  // iframe 内元素的矩形先换算到顶层视口（内层 rect 相对内嵌视口，不能直接比）
+  var r=baizeToTopRect(e,e.getBoundingClientRect());
   if(!(r.width>=2&&r.height>=2))return;
   if(e.disabled)return;
-  var cs=getComputedStyle(e);
+  var cs=baizeStyle(e);
   if(cs.visibility==='hidden'||cs.display==='none'||parseFloat(cs.opacity||'1')<0.05)return;
   var tag=(e.tagName||'').toLowerCase();
   var role=(e.getAttribute('role')||'').toLowerCase();
@@ -861,33 +950,46 @@ var consider=function(e,score){
 };
 // 第一遍只扫「本来就是控件」的元素：绝大多数 click_text 目标（按钮/链接/输入框/菜单项）
 // 在这里就命中，不必碰正文里成千上万个 div/span。
+// 枚举跨所有根（顶层 light DOM + 开放 shadowRoot + 同源 iframe），每个根之间互不重叠。
 var fast='a,button,[role=button],[role=link],[role=tab],[role=menuitem],[role=option],'
  +'input[type=submit],input[type=button],input[type=reset],input[type=image],label,summary,'
  +'[onclick],[tabindex],[contenteditable]';
-var all=document.querySelectorAll(fast),i,e;
-for(i=0;i<all.length;i++){e=all[i];consider(e,scoreOf(e));}
+var roots=baizeDeepRoots(null),i,e,ri,found;
+for(ri=0;ri<roots.length;ri++){
+  try{found=roots[ri].querySelectorAll(fast);}catch(err){continue;}
+  for(i=0;i<found.length;i++){e=found[i];consider(e,scoreOf(e));}
+}
 // 第二遍只在第一遍没有「精确命中」时才跑：按文本节点找它的父元素，而不是遍历所有 div。
 // 这样既能点到 div/span/p 里的纯文字，又不会对每个容器做一次 innerText。
+// 对每个根各走一遍（Document 自己有 createTreeWalker；ShadowRoot / 元素容器
+// 借 ownerDocument 的，遍历范围仍限定在该根内）。
 if(bestScore>1){
   var seen=new Set();
-  var root=document.body||document.documentElement;
-  var walker=document.createTreeWalker(root,NodeFilter.SHOW_TEXT,null);
-  while(walker.nextNode()){
-    var n=walker.currentNode;
-    if(!n.nodeValue||!n.nodeValue.trim())continue;
-    e=n.parentElement;
-    if(!e||seen.has(e))continue;
-    var tn=(e.tagName||'').toUpperCase();
-    if(tn==='SCRIPT'||tn==='STYLE'||tn==='NOSCRIPT'||tn==='TEMPLATE')continue;
-    seen.add(e);
-    consider(e,scoreOf(e));
+  var walker;
+  for(ri=0;ri<roots.length;ri++){
+    var rt=roots[ri];
+    var walkRoot=rt.body||rt.documentElement||rt;
+    var twOwner=(rt.nodeType===9&&rt.createTreeWalker)?rt:(rt.ownerDocument||document);
+    try{walker=twOwner.createTreeWalker(walkRoot,NodeFilter.SHOW_TEXT,null);}catch(err){continue;}
+    while(walker.nextNode()){
+      var n=walker.currentNode;
+      if(!n.nodeValue||!n.nodeValue.trim())continue;
+      e=n.parentElement;
+      if(!e||seen.has(e))continue;
+      var tn=(e.tagName||'').toUpperCase();
+      if(tn==='SCRIPT'||tn==='STYLE'||tn==='NOSCRIPT'||tn==='TEMPLATE')continue;
+      seen.add(e);
+      consider(e,scoreOf(e));
+    }
   }
 }
 if(!best)return 'null';
-var r=bestRect||best.getBoundingClientRect();
-// **只在需要时才滚**，而且滚最小的距离（block:'nearest'）。
+var r=bestRect||baizeToTopRect(best,best.getBoundingClientRect());
+// **只在需要时才滚**，而且滚最小的距离（block:'nearest'）。跨 frame 的 scrollIntoView
+// 会连内层滚动容器一起滚，滚完重取矩形再换算一次。
 var need=(r.top<-2||r.bottom>innerHeight+2||r.left<-2||r.right>innerWidth+2);
-if(need){try{best.scrollIntoView({block:'nearest',inline:'nearest'});}catch(err){}r=best.getBoundingClientRect();}
+if(need){try{best.scrollIntoView({block:'nearest',inline:'nearest'});}catch(err){}
+  r=baizeToTopRect(best,best.getBoundingClientRect());}
 if(!(r.width>=2&&r.height>=2))return 'null';
 if(__BAIZE_MARK__)__baizeMark(r.left,r.top,r.width,r.height,__BAIZE_HOLD__);
 return JSON.stringify({x:r.left,y:r.top,w:r.width,h:r.height,scrolled:need,
@@ -897,7 +999,10 @@ return JSON.stringify({x:r.left,y:r.top,w:r.width,h:r.height,scrolled:need,
     ||best.getAttribute('aria-label')||best.getAttribute('title')
     ||best.getAttribute('placeholder')||'').slice(0,80),
   tag:(best.tagName||'').toLowerCase(),
-  sel:baizeCssPath(best),href:location.href});})()"#;
+  // 穿透定位（shadowRoot / iframe 内）的元素没有「从顶层文档出发」的选择器，
+  // 缓存校验按顶层 querySelector 必失败——返回空 sel，locator 缓存自动跳过。
+  sel:(best.getRootNode&&best.getRootNode()===document)?baizeCssPath(best):'',
+  href:location.href});})()"#;
 
 /// 页面元素扫描脚本：**一次 evaluate** 枚举当前视口内的可交互元素，并在页面里给每个
 /// 元素画一个**编号线框**（`1..n`），返回编号清单。
@@ -911,6 +1016,7 @@ return JSON.stringify({x:r.left,y:r.top,w:r.width,h:r.height,scrolled:need,
 /// `__BAIZE_SCOPE__` 给文字时先定位「那个模块」的容器（id / aria-label / class / 文本），
 /// 找就枚举它内部；找不到则退回整页并在返回里标明（`scope_miss`），不静默换范围。
 const SCAN_JS: &str = r#"(function(){
+__BAIZE_DEEP__
 if(typeof document==='undefined'||!document.documentElement)return 'null';
 var norm=function(s){return (s||'').replace(/\s+/g,' ').trim();};
 var vw=window.innerWidth||0,vh=window.innerHeight||0;
@@ -921,6 +1027,7 @@ var oldEls=document.querySelectorAll('[data-baize-mark]');
 for(var q=0;q<oldEls.length;q++){try{oldEls[q].removeAttribute('data-baize-mark');}catch(e){}}
 // ② 划定范围
 var root=document.documentElement,scope=__BAIZE_SCOPE__,scopeMiss=false,scopeName='(整页)';
+var scopeEl=null;
 if(scope){
   var want=String(scope).toLowerCase(),best=null,bestScore=1e9;
   var boxes=document.querySelectorAll('aside,nav,section,header,footer,main,form,div,ul,[role=navigation],[role=region],[role=tabpanel],[role=dialog],[role=complementary],[role=toolbar]');
@@ -939,7 +1046,7 @@ if(scope){
     else{var tx=(e0.textContent||'').toLowerCase();if(tx.length<20000&&tx.indexOf(want)>=0)s=5+Math.min(3,tx.length/2000);}
     if(s<1e9&&s<bestScore){bestScore=s;best=e0;}
   }
-  if(best){root=best;scopeName='(模块内)';
+  if(best){scopeEl=best;scopeName='(模块内)';
     // 指定了模块就先把模块带进视口：否则枚举出来的元素全在视口外、编号框一个也画不出来，
     // 用户看到的就是「说了扫这个模块却什么都没框」。只在模块确实不在视口里时才滚（最小距离）。
     try{var rb=best.getBoundingClientRect();
@@ -950,44 +1057,53 @@ if(scope){
 var sel='a[href],button,input:not([type=hidden]),select,textarea,summary,'
  +'[role=button],[role=link],[role=tab],[role=menuitem],[role=option],[role=checkbox],[role=radio],[role=switch],'
  +'[onclick],[contenteditable="true"],[tabindex]:not([tabindex="-1"])';
-var list=root.querySelectorAll(sel),limit=__BAIZE_LIMIT__;
+var limit=__BAIZE_LIMIT__;
+// 枚举跨所有根（scope 容器 / 顶层 light DOM + 开放 shadowRoot + 同源 iframe）。
+// 元素矩形统一换算到顶层视口坐标：编号框画在顶层文档，click_mark 的 CDP 点击
+// 也发生在顶层坐标系——不换算的话 iframe 内元素的框和点击都会错位。
+var roots=baizeDeepRoots(scopeEl);
 var host=document.createElement('div');host.id='__baize_marks__';
 var hp=function(k,v){host.style.setProperty(k,v,'important');};
 hp('position','fixed');hp('left','0');hp('top','0');hp('width','0');hp('height','0');
 hp('margin','0');hp('padding','0');hp('pointer-events','none');hp('z-index','2147483647');
 var items=[],n=0,offAbove=0,offBelow=0;
-for(var i=0;i<list.length;i++){
-  if(n>=limit)break;
-  var e=list[i],r=e.getBoundingClientRect();
-  if(!(r.width>=8&&r.height>=8))continue;
-  var inView=!(r.bottom<0||r.top>vh||r.right<0||r.left>vw);
-  var cs=getComputedStyle(e);
-  if(cs.visibility==='hidden'||cs.display==='none'||parseFloat(cs.opacity||'1')<0.05)continue;
-  if(e.disabled)continue;
-  // 只列视口内的（框得出来也点得到）；视口外的**只计数**——把「下面还有 3 个、上面还有 1 个」
-  // 告诉FLUX，它才知道到底要不要滚、往哪滚；否则它只能为了「找找看」把页面盲滚一遍。
-  if(!inView){if(r.top>=vh)offBelow++;else offAbove++;continue;}
-  var label=norm(e.innerText||e.textContent||e.value||e.getAttribute('aria-label')||e.getAttribute('placeholder')||e.getAttribute('title')||'');
-  label=label.slice(0,50);
-  if(!label){var t2=norm(e.getAttribute('type')||e.getAttribute('name')||'');label=t2?('['+t2+']'):'';}
-  n++;
-  try{e.setAttribute('data-baize-mark',String(n));}catch(err){}
-  var b=document.createElement('div'),bs=b.style;
-  var bp=function(k,v){bs.setProperty(k,v,'important');};
-  bp('position','fixed');bp('left',r.left+'px');bp('top',r.top+'px');
-  bp('width',r.width+'px');bp('height',r.height+'px');
-  bp('border','1px solid #ff3b30');bp('box-sizing','border-box');
-  bp('margin','0');bp('padding','0');bp('background','transparent');bp('border-radius','2px');
-  var num=document.createElement('span'),ns=num.style;
-  var np=function(k,v){ns.setProperty(k,v,'important');};
-  np('position','absolute');np('font','10px/12px monospace');np('background','#ff3b30');
-  np('color','#fff');np('padding','0 3px');np('border-radius','2px');
-  if(r.top>=16){np('left','-1px');np('top','-14px');}else{np('left','2px');np('top','2px');}
-  num.textContent=String(n);
-  b.appendChild(num);
-  host.appendChild(b);
-  items.push({n:n,tag:(e.tagName||'').toLowerCase(),type:(e.getAttribute('type')||''),text:label,
-    x:Math.round(r.left),y:Math.round(r.top),w:Math.round(r.width),h:Math.round(r.height)});
+outer:
+for(var ri=0;ri<roots.length;ri++){
+  var list;
+  try{list=roots[ri].querySelectorAll(sel);}catch(err){continue;}
+  for(var i=0;i<list.length;i++){
+    if(n>=limit)break outer;
+    var e=list[i],r=baizeToTopRect(e,e.getBoundingClientRect());
+    if(!(r.width>=8&&r.height>=8))continue;
+    var inView=!(r.bottom<0||r.top>vh||r.right<0||r.left>vw);
+    var cs=baizeStyle(e);
+    if(cs.visibility==='hidden'||cs.display==='none'||parseFloat(cs.opacity||'1')<0.05)continue;
+    if(e.disabled)continue;
+    // 只列视口内的（框得出来也点得到）；视口外的**只计数**——把「下面还有 3 个、上面还有 1 个」
+    // 告诉FLUX，它才知道到底要不要滚、往哪滚；否则它只能为了「找找看」把页面盲滚一遍。
+    if(!inView){if(r.top>=vh)offBelow++;else offAbove++;continue;}
+    var label=norm(e.innerText||e.textContent||e.value||e.getAttribute('aria-label')||e.getAttribute('placeholder')||e.getAttribute('title')||'');
+    label=label.slice(0,50);
+    if(!label){var t2=norm(e.getAttribute('type')||e.getAttribute('name')||'');label=t2?('['+t2+']'):'';}
+    n++;
+    try{e.setAttribute('data-baize-mark',String(n));}catch(err){}
+    var b=document.createElement('div'),bs=b.style;
+    var bp=function(k,v){bs.setProperty(k,v,'important');};
+    bp('position','fixed');bp('left',r.left+'px');bp('top',r.top+'px');
+    bp('width',r.width+'px');bp('height',r.height+'px');
+    bp('border','1px solid #ff3b30');bp('box-sizing','border-box');
+    bp('margin','0');bp('padding','0');bp('background','transparent');bp('border-radius','2px');
+    var num=document.createElement('span'),ns=num.style;
+    var np=function(k,v){ns.setProperty(k,v,'important');};
+    np('position','absolute');np('font','10px/12px monospace');np('background','#ff3b30');
+    np('color','#fff');np('padding','0 3px');np('border-radius','2px');
+    if(r.top>=16){np('left','-1px');np('top','-14px');}else{np('left','2px');np('top','2px');}
+    num.textContent=String(n);
+    b.appendChild(num);
+    host.appendChild(b);
+    items.push({n:n,tag:(e.tagName||'').toLowerCase(),type:(e.getAttribute('type')||''),text:label,
+      x:Math.round(r.left),y:Math.round(r.top),w:Math.round(r.width),h:Math.round(r.height)});
+  }
 }
 (document.body||document.documentElement).appendChild(host);
 clearTimeout(window.__baize_marks_t__);
@@ -1101,7 +1217,8 @@ fn mark_selector_css(
     }
     let js = mark_template(MARK_SELECTOR_JS)
         .replace("__BAIZE_SEL__", &sel)
-        .replace("__BAIZE_HOLD__", &hold_ms.to_string());
+        .replace("__BAIZE_HOLD__", &hold_ms.to_string())
+        .replace("__BAIZE_DEEP__", PIERCE_HELPERS_JS);
     let raw = tab.evaluate(&js, false).ok()?.value?;
     let s = raw.as_str()?;
     if s == "null" {
@@ -1185,6 +1302,7 @@ fn dom_locate_by_text(
     };
     let js = base
         .replace("__BAIZE_CSSPATH__", CSS_PATH_FN)
+        .replace("__BAIZE_DEEP__", PIERCE_HELPERS_JS)
         .replace("__BAIZE_TARGET__", &t);
     let raw = tab.evaluate(&js, false).ok()?.value?;
     let s = raw.as_str()?;
@@ -1549,7 +1667,8 @@ fn scan_interactive(
     let js = SCAN_JS
         .replace("__BAIZE_SCOPE__", &scope_lit)
         .replace("__BAIZE_LIMIT__", &limit.to_string())
-        .replace("__BAIZE_HOLD__", &MARK_HOLD_SCAN.to_string());
+        .replace("__BAIZE_HOLD__", &MARK_HOLD_SCAN.to_string())
+        .replace("__BAIZE_DEEP__", PIERCE_HELPERS_JS);
     let raw = tab
         .evaluate(&js, false)
         .map_err(|e| format!("扫描页面元素失败: {e}"))?
