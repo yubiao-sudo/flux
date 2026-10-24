@@ -4,6 +4,7 @@ import { AnimatePresence, motion } from 'framer-motion';
 import { OrbCanvas } from './orb/OrbCanvas';
 import { Transcript } from './components/Transcript';
 import { RainField } from './components/RainField';
+import Clock from './components/Clock';
 import { WindowChrome } from './components/WindowChrome';
 import { CommandTrace } from './components/CommandTrace';
 import { CommandPalette, type PaletteAction } from './components/CommandPalette';
@@ -21,6 +22,17 @@ import type { SystemsTabId } from './engine/SystemsPanel';
 import { useFluxEngine } from './engine/useFluxEngine';
 import { jobHuntTaskPrompt, jobHuntWaitStart, jobHuntWaitStop, restartFlux } from './engine/api';
 import { stopSpeaking } from './engine/voiceReactive';
+import {
+  isApplyCommand,
+  isApproveWord,
+  isDenyWord,
+  isStopWaitCommand,
+  isStopWord,
+  isWaitCommand,
+  panelCommand,
+  wantsInspection,
+  type PanelTarget,
+} from './intents';
 import { createStreamingSpeech } from './engine/streamingSpeech';
 import { installAudioUnlock, playSfx } from './engine/utils/sound';
 import { FluxAudio } from './audio';
@@ -42,6 +54,15 @@ const makeTurn = (role: Turn['role'], text: string): Turn => ({
   text,
   at: Date.now(),
 });
+
+/** 语音打开面板后的提示语（面板判定在 intents.ts，文案是视图层的事） */
+const PANEL_HINTS: Record<PanelTarget, string> = {
+  settings: '核心设置 · 选择、编辑或测试模型',
+  capabilities: '能力星图 · 引擎的全部工具已接入',
+  memory: '记忆场 · 长期记忆与知识已接入',
+  sessions: '会话历史 · 切换、导出或建立新的会话',
+  systems: '引擎控制 · 自动化、审计、连接器、会议室',
+};
 
 const settingsCategoryForTab = (tab: string): SettingsCategory => {
   if (['model', 'models'].includes(tab)) return 'models';
@@ -146,7 +167,6 @@ export function App() {
       typeof window !== 'undefined' &&
       window.matchMedia?.('(prefers-reduced-motion: reduce)').matches === true,
   );
-  const [now, setNow] = useState(() => new Date());
   const [hint, setHint] = useState('轻触星核说话 · 按 1—5 预览能力');
   const [demoRunning, setDemoRunning] = useState(false);
   const [composerOpen, setComposerOpen] = useState(false);
@@ -211,7 +231,6 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    const tick = window.setInterval(() => setNow(new Date()), 1000);
     // 启动动画：先让遮罩上的品牌字成形（约 1s），再揭开场景。
     // 星核与 HUD 在揭开后才淡入，避免"黑底上突然出现"。
     // 减少动态效果（prefers-reduced-motion）时直接跳过。
@@ -221,7 +240,6 @@ export function App() {
     const enterTimer = window.setTimeout(() => setEntered(true), reduce ? 0 : 1000);
     const bootTimer = window.setTimeout(() => setBooted(true), reduce ? 0 : 2050);
     return () => {
-      window.clearInterval(tick);
       window.clearTimeout(enterTimer);
       window.clearTimeout(bootTimer);
       audio.disableMic();
@@ -559,11 +577,10 @@ export function App() {
       setDemoRunning(false);
 
       if (engine.available) {
-        const normalized = input.toLowerCase();
-
+        // 意图模式匹配在 src/intents.ts（纯函数）；这里只负责执行动作。
         // 求职投递命令：/投递、/投简历、投递简历 —— 把用户配置组装成任务提示词再下发，
         // 保证「命令触发」和「面板开始投递」走同一份配置、同一段任务描述。
-        if (/^\/?(投递|投简历|投递简历|apply)(\s|$)/.test(normalized.trim())) {
+        if (isApplyCommand(input)) {
           try {
             const prompt = await jobHuntTaskPrompt();
             setVoiceState('thinking');
@@ -579,7 +596,7 @@ export function App() {
         }
 
         // 等待回复命令：/等回复、/等待回复、wait —— 进入 30 分钟后台监控
-        if (/^\/?(等回复|等待回复|等消息|wait)(\s|$)/.test(normalized.trim())) {
+        if (isWaitCommand(input)) {
           try {
             await jobHuntWaitStart(30);
             setVoiceState('idle');
@@ -592,7 +609,7 @@ export function App() {
         }
 
         // 停止等待
-        if (/^\/?(停止等待|停止等回复|stop\s*wait)(\s|$)/.test(normalized.trim())) {
+        if (isStopWaitCommand(input)) {
           try {
             await jobHuntWaitStop();
             setVoiceState('idle');
@@ -605,12 +622,12 @@ export function App() {
         }
 
         if (engine.permissions.length > 0) {
-          if (/允许|同意|可以|批准|allow|yes/.test(normalized)) {
+          if (isApproveWord(input)) {
             const request = engine.permissions[0];
             await engine.resolveRequest(request.id, true, false);
             setVoiceState('idle');
             setHint('已允许本次动作 · 引擎继续');
-          } else if (/拒绝|不允许|不要|deny|no/.test(normalized)) {
+          } else if (isDenyWord(input)) {
             const request = engine.permissions[0];
             await engine.resolveRequest(request.id, false, false);
             setVoiceState('idle');
@@ -622,40 +639,16 @@ export function App() {
           return;
         }
 
-        if (/关闭|收起|停止|退出|取消|stop|cancel/.test(normalized)) {
+        if (isStopWord(input)) {
           await engine.stop();
           closeAll();
           setVoiceState('idle');
           return;
         }
-        const panelCommand = (pattern: RegExp) => normalized.length <= 24 && pattern.test(normalized);
-        if (panelCommand(/^(打开|看看|查看|显示|进入|回到|切换)?\s*(设置|模型|配置|model|setting|config)/)) {
-          openLarge('settings');
-          setHint('核心设置 · 选择、编辑或测试模型');
-          setVoiceState('idle');
-          return;
-        }
-        if (panelCommand(/^(打开|看看|查看|显示|进入|回到|切换)?\s*(能力|工具|星图|capab|tool)/)) {
-          openLarge('capabilities');
-          setHint('能力星图 · 引擎的全部工具已接入');
-          setVoiceState('idle');
-          return;
-        }
-        if (panelCommand(/^(打开|看看|查看|显示|进入|回到|切换)?\s*(记忆|memory)/)) {
-          openLarge('memory');
-          setHint('记忆场 · 长期记忆与知识已接入');
-          setVoiceState('idle');
-          return;
-        }
-        if (panelCommand(/^(打开|看看|查看|显示|进入|回到|切换)?\s*(会话|历史|对话记录|conversation|history)/)) {
-          openLarge('sessions');
-          setHint('会话历史 · 切换、导出或建立新的会话');
-          setVoiceState('idle');
-          return;
-        }
-        if (/控制台|引擎控制|系统面板|engine control|systems panel/.test(normalized)) {
-          openLarge('systems');
-          setHint('引擎控制 · 自动化、审计、连接器、会议室');
+        const panel = panelCommand(input);
+        if (panel) {
+          openLarge(panel);
+          setHint(PANEL_HINTS[panel]);
           setVoiceState('idle');
           return;
         }
@@ -681,9 +674,7 @@ export function App() {
         // 任务一提交就先开口，不等模型首 token。只做一句本地确认，
         // 不预测具体步骤，避免在还不知道工具结果时说过头。
         speechRef.current.ack(
-          /看|查|找|搜|浏览|打开|读/.test(normalized)
-            ? '好的，我先看一下。'
-            : '好的，我先处理一下。',
+          wantsInspection(input) ? '好的，我先看一下。' : '好的，我先处理一下。',
         );
         const result = await engine.send(input);
         if (seq !== sequenceRef.current) {
@@ -1118,26 +1109,8 @@ export function App() {
     };
   }, [addTurn, closeAll, engine, openLarge, openSmall, runDemo]);
 
-  const dateStamp = useMemo(
-    () =>
-      new Intl.DateTimeFormat('zh-CN', {
-        month: '2-digit',
-        day: '2-digit',
-        weekday: 'short',
-      }).format(now),
-    [now],
-  );
-
-  const timeStamp = useMemo(
-    () =>
-      now.toLocaleTimeString('zh-CN', {
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit',
-        hour12: false,
-      }),
-    [now],
-  );
+  // HUD 时钟拆成 <Clock/> 叶子组件：每秒跳一次的状态只重渲染两个 span，
+  // 不再让整棵 App 树跟着走。见 components/Clock.tsx。
 
   const paletteActions: PaletteAction[] = [
     {
@@ -1334,8 +1307,7 @@ export function App() {
         </div>
         <div className="hud-clock">
           <span className="hud-place">HANGZHOU · 30.27°N</span>
-          <span className="hud-date">{dateStamp}</span>
-          <span className="hud-time">{timeStamp}</span>
+          <Clock />
         </div>
       </header>
 

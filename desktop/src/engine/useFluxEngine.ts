@@ -159,33 +159,46 @@ export type FluxNotice = {
  */
 function extractChatCards(text: string): { text: string; cards: ChatCardData[] } {
   const cards: ChatCardData[] = [];
-  const cleaned = text.replace(/```chat_card\s*\n?([\s\S]*?)```/g, (_all, body: string) => {
-    try {
-      const parsed = JSON.parse(body.trim()) as {
-        title?: string;
-        html?: string;
-        width?: string;
-        height?: string;
-      };
-      const html = String(parsed.html ?? '').trim();
-      if (html) {
-        cards.push({
-          id: `chat-card-${Date.now()}-${cards.length}-${Math.random().toString(36).slice(2, 6)}`,
-          title: String(parsed.title ?? ''),
-          html,
-          width: String(parsed.width ?? '100%'),
-          height: String(parsed.height ?? ''),
-        });
+  const cleaned = text
+    .replace(/```chat_card\s*\n?([\s\S]*?)```/g, (_all, body: string) => {
+      try {
+        const parsed = JSON.parse(body.trim()) as {
+          title?: string;
+          html?: string;
+          width?: string;
+          height?: string;
+        };
+        const html = String(parsed.html ?? '').trim();
+        if (html) {
+          cards.push({
+            id: `chat-card-${Date.now()}-${cards.length}-${Math.random().toString(36).slice(2, 6)}`,
+            title: String(parsed.title ?? ''),
+            html,
+            width: String(parsed.width ?? '100%'),
+            height: String(parsed.height ?? ''),
+          });
+        }
+      } catch {
+        // Malformed card is discarded; the transcript must stay clean.
       }
-    } catch {
-      // Malformed card is discarded; the transcript must stay clean.
-    }
-    return '';
-  });
+      return '';
+    })
+    // 模型偶尔忘写闭合围栏：未闭合的卡块整段丢弃，否则卡片 JSON 会以
+    // `{"height":"","html":"<style>…` 的原样留在转录流里（截图里出过一次）。
+    .replace(/```chat_card[\s\S]*$/, '');
   return {
     text: cleaned.replace(/\n{3,}/g, '\n\n').trim(),
     cards,
   };
+}
+
+/**
+ * 流式过程中的正文清洗：卡块是附在回复末尾的，token 会把它逐字打进转录流——
+ * 不剥的话用户会看着 `{"html":"<style>…` 滚好几秒，直到终稿才被剥掉。
+ * 普通代码块（```json / ```python 等）不受影响：尾部只切 ```chat_card 开头的块。
+ */
+function cleanStreamingText(text: string): string {
+  return extractChatCards(text).text;
 }
 
 const FLUX_CONVERSATION_TITLE = 'FLUX / 流形';
@@ -294,6 +307,9 @@ export function useFluxEngine() {
   const [narration, setNarration] = useState('');
   const narrationFilterRef = useRef<NarrationStreamFilter | null>(null);
   if (!narrationFilterRef.current) narrationFilterRef.current = new NarrationStreamFilter();
+  // 流式 token 的原始累积：转录流渲染的是清洗后的文本（剥 chat_card），发送/清空
+  // 与重置必须连这里一起清，否则下一轮会混入上一轮残留。
+  const rawStreamRef = useRef('');
   const [thoughts, setThoughts] = useState<ThoughtEvent[]>([]);
   const [permissions, setPermissions] = useState<PermissionRequest[]>([]);
   const [cards, setCards] = useState<AcuiCardData[]>([]);
@@ -522,13 +538,17 @@ export function useFluxEngine() {
           onChatToken((token) => {
             if (!aliveRef.current || !chatBusyRef.current) return;
             const visible = narrationFilterRef.current?.push(token) ?? token;
-            if (visible) setStreaming((current) => current + visible);
+            if (visible) {
+              rawStreamRef.current += visible;
+              setStreaming(cleanStreamingText(rawStreamRef.current));
+            }
           }),
         ),
         add(
           onChatRoundReset(() => {
             if (!aliveRef.current || !chatBusyRef.current) return;
             narrationFilterRef.current?.reset();
+            rawStreamRef.current = '';
             setStreaming('');
           }),
         ),
@@ -715,6 +735,7 @@ export function useFluxEngine() {
 
       const history = toHistory(turns);
       setThoughts([]);
+      rawStreamRef.current = '';
       setStreaming('');
       setNarration('');
       narrationFilterRef.current?.reset();
@@ -757,6 +778,7 @@ export function useFluxEngine() {
         chatBusyRef.current = false;
         if (aliveRef.current) {
           setBusy(false);
+          rawStreamRef.current = '';
           setStreaming('');
           setNarration('');
           narrationFilterRef.current?.reset();
