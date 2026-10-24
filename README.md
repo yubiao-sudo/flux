@@ -234,8 +234,11 @@ audit and the remaining UI-only gaps.
 
 **Windows installer:**
 [`release/FLUX_1.0.0_x64-setup.exe`](release/FLUX_1.0.0_x64-setup.exe) — NSIS,
-per-user install, no data or keys bundled. Size 39,212,740 bytes · SHA-256
-`8C6C147F597DEF0080F54B3B6965CD3073471D149D731891E12405B34FA3CC7C`.
+per-user install, no data or keys bundled. Size 39,274,658 bytes · SHA-256
+`6D2A24E1D93F8984309722141572C0004C114FBCB5B9AAE54D6A74ECD8E79103`.
+This build carries the subagent permission enforcement, the
+`http_request` / `db_query` reclassification, shadow-DOM / same-origin
+iframe piercing for the browser tools and the qwen2.5vl vision default.
 
 ## Run
 
